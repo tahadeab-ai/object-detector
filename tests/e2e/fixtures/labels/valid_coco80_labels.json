@@ -1,0 +1,402 @@
+[
+  {
+    "id": 0,
+    "name_en": "person",
+    "name_ar": "شخص"
+  },
+  {
+    "id": 1,
+    "name_en": "bicycle",
+    "name_ar": "دراجة هوائية"
+  },
+  {
+    "id": 2,
+    "name_en": "car",
+    "name_ar": "سيارة"
+  },
+  {
+    "id": 3,
+    "name_en": "motorcycle",
+    "name_ar": "دراجة نارية"
+  },
+  {
+    "id": 4,
+    "name_en": "airplane",
+    "name_ar": "طائرة"
+  },
+  {
+    "id": 5,
+    "name_en": "bus",
+    "name_ar": "حافلة"
+  },
+  {
+    "id": 6,
+    "name_en": "train",
+    "name_ar": "قطار"
+  },
+  {
+    "id": 7,
+    "name_en": "truck",
+    "name_ar": "شاحنة"
+  },
+  {
+    "id": 8,
+    "name_en": "boat",
+    "name_ar": "قارب"
+  },
+  {
+    "id": 9,
+    "name_en": "traffic light",
+    "name_ar": "إشارة مرور"
+  },
+  {
+    "id": 10,
+    "name_en": "fire hydrant",
+    "name_ar": "صنبور إطفاء"
+  },
+  {
+    "id": 11,
+    "name_en": "stop sign",
+    "name_ar": "علامة توقف"
+  },
+  {
+    "id": 12,
+    "name_en": "parking meter",
+    "name_ar": "عداد مواقف"
+  },
+  {
+    "id": 13,
+    "name_en": "bench",
+    "name_ar": "مقعد"
+  },
+  {
+    "id": 14,
+    "name_en": "bird",
+    "name_ar": "طائر"
+  },
+  {
+    "id": 15,
+    "name_en": "cat",
+    "name_ar": "قطة"
+  },
+  {
+    "id": 16,
+    "name_en": "dog",
+    "name_ar": "كلب"
+  },
+  {
+    "id": 17,
+    "name_en": "horse",
+    "name_ar": "حصان"
+  },
+  {
+    "id": 18,
+    "name_en": "sheep",
+    "name_ar": "خروف"
+  },
+  {
+    "id": 19,
+    "name_en": "cow",
+    "name_ar": "بقرة"
+  },
+  {
+    "id": 20,
+    "name_en": "elephant",
+    "name_ar": "فيل"
+  },
+  {
+    "id": 21,
+    "name_en": "bear",
+    "name_ar": "دب"
+  },
+  {
+    "id": 22,
+    "name_en": "zebra",
+    "name_ar": "حمار وحشي"
+  },
+  {
+    "id": 23,
+    "name_en": "giraffe",
+    "name_ar": "زرافة"
+  },
+  {
+    "id": 24,
+    "name_en": "backpack",
+    "name_ar": "حقيبة ظهر"
+  },
+  {
+    "id": 25,
+    "name_en": "umbrella",
+    "name_ar": "مظلة"
+  },
+  {
+    "id": 26,
+    "name_en": "handbag",
+    "name_ar": "حقيبة يد"
+  },
+  {
+    "id": 27,
+    "name_en": "tie",
+    "name_ar": "ربطة عنق"
+  },
+  {
+    "id": 28,
+    "name_en": "suitcase",
+    "name_ar": "حقيبة سفر"
+  },
+  {
+    "id": 29,
+    "name_en": "frisbee",
+    "name_ar": "قرص طائر"
+  },
+  {
+    "id": 30,
+    "name_en": "skis",
+    "name_ar": "زلاجات"
+  },
+  {
+    "id": 31,
+    "name_en": "snowboard",
+    "name_ar": "لوح تزلج"
+  },
+  {
+    "id": 32,
+    "name_en": "sports ball",
+    "name_ar": "كرة رياضية"
+  },
+  {
+    "id": 33,
+    "name_en": "kite",
+    "name_ar": "طائرة ورقية"
+  },
+  {
+    "id": 34,
+    "name_en": "baseball bat",
+    "name_ar": "مضرب بيسبول"
+  },
+  {
+    "id": 35,
+    "name_en": "baseball glove",
+    "name_ar": "قفاز بيسبول"
+  },
+  {
+    "id": 36,
+    "name_en": "skateboard",
+    "name_ar": "لوح تزلج"
+  },
+  {
+    "id": 37,
+    "name_en": "surfboard",
+    "name_ar": "لوح ركوب الأمواج"
+  },
+  {
+    "id": 38,
+    "name_en": "tennis racket",
+    "name_ar": "مضرب تنس"
+  },
+  {
+    "id": 39,
+    "name_en": "bottle",
+    "name_ar": "زجاجة"
+  },
+  {
+    "id": 40,
+    "name_en": "wine glass",
+    "name_ar": "كأس"
+  },
+  {
+    "id": 41,
+    "name_en": "cup",
+    "name_ar": "كوب"
+  },
+  {
+    "id": 42,
+    "name_en": "fork",
+    "name_ar": "شوكة"
+  },
+  {
+    "id": 43,
+    "name_en": "knife",
+    "name_ar": "سكين"
+  },
+  {
+    "id": 44,
+    "name_en": "spoon",
+    "name_ar": "ملعقة"
+  },
+  {
+    "id": 45,
+    "name_en": "bowl",
+    "name_ar": "وعاء"
+  },
+  {
+    "id": 46,
+    "name_en": "banana",
+    "name_ar": "موز"
+  },
+  {
+    "id": 47,
+    "name_en": "apple",
+    "name_ar": "تفاح"
+  },
+  {
+    "id": 48,
+    "name_en": "sandwich",
+    "name_ar": "شطيرة"
+  },
+  {
+    "id": 49,
+    "name_en": "orange",
+    "name_ar": "برتقال"
+  },
+  {
+    "id": 50,
+    "name_en": "broccoli",
+    "name_ar": "بروكلي"
+  },
+  {
+    "id": 51,
+    "name_en": "carrot",
+    "name_ar": "جزر"
+  },
+  {
+    "id": 52,
+    "name_en": "hot dog",
+    "name_ar": "هوت دوغ"
+  },
+  {
+    "id": 53,
+    "name_en": "pizza",
+    "name_ar": "بيتزا"
+  },
+  {
+    "id": 54,
+    "name_en": "donut",
+    "name_ar": "دونات"
+  },
+  {
+    "id": 55,
+    "name_en": "cake",
+    "name_ar": "كعكة"
+  },
+  {
+    "id": 56,
+    "name_en": "chair",
+    "name_ar": "كرسي"
+  },
+  {
+    "id": 57,
+    "name_en": "couch",
+    "name_ar": "أريكة"
+  },
+  {
+    "id": 58,
+    "name_en": "potted plant",
+    "name_ar": "نبتة في وعاء"
+  },
+  {
+    "id": 59,
+    "name_en": "bed",
+    "name_ar": "سرير"
+  },
+  {
+    "id": 60,
+    "name_en": "dining table",
+    "name_ar": "طاولة طعام"
+  },
+  {
+    "id": 61,
+    "name_en": "toilet",
+    "name_ar": "مرحاض"
+  },
+  {
+    "id": 62,
+    "name_en": "tv",
+    "name_ar": "تلفزيون"
+  },
+  {
+    "id": 63,
+    "name_en": "laptop",
+    "name_ar": "حاسوب محمول"
+  },
+  {
+    "id": 64,
+    "name_en": "mouse",
+    "name_ar": "فأرة"
+  },
+  {
+    "id": 65,
+    "name_en": "remote",
+    "name_ar": "جهاز تحكم"
+  },
+  {
+    "id": 66,
+    "name_en": "keyboard",
+    "name_ar": "لوحة مفاتيح"
+  },
+  {
+    "id": 67,
+    "name_en": "cell phone",
+    "name_ar": "هاتف محمول"
+  },
+  {
+    "id": 68,
+    "name_en": "microwave",
+    "name_ar": "ميكروويف"
+  },
+  {
+    "id": 69,
+    "name_en": "oven",
+    "name_ar": "فرن"
+  },
+  {
+    "id": 70,
+    "name_en": "toaster",
+    "name_ar": "محمصة"
+  },
+  {
+    "id": 71,
+    "name_en": "sink",
+    "name_ar": "مغسلة"
+  },
+  {
+    "id": 72,
+    "name_en": "refrigerator",
+    "name_ar": "ثلاجة"
+  },
+  {
+    "id": 73,
+    "name_en": "book",
+    "name_ar": "كتاب"
+  },
+  {
+    "id": 74,
+    "name_en": "clock",
+    "name_ar": "ساعة"
+  },
+  {
+    "id": 75,
+    "name_en": "vase",
+    "name_ar": "مزهرية"
+  },
+  {
+    "id": 76,
+    "name_en": "scissors",
+    "name_ar": "مقص"
+  },
+  {
+    "id": 77,
+    "name_en": "teddy bear",
+    "name_ar": "دب لعبة"
+  },
+  {
+    "id": 78,
+    "name_en": "hair drier",
+    "name_ar": "مجفف شعر"
+  },
+  {
+    "id": 79,
+    "name_en": "toothbrush",
+    "name_ar": "فرشاة أسنان"
+  }
+]

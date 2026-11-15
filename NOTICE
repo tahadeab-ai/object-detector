@@ -1,0 +1,31 @@
+YOLO NCNN Detector
+Copyright 2026 Taha Deab (https://github.com/tahadeab-ai)
+
+This product includes software developed as part of the YOLO NCNN Detector
+project (https://github.com/tahadeab-ai/object-detector).
+
+This product contains or derives from the following open-source components:
+
+1. Ultralytics YOLO11
+   Copyright (c) 2023-2026 Ultralytics Inc.
+   Website: https://ultralytics.com
+   Repository: https://github.com/ultralytics/ultralytics
+   License: GNU Affero General Public License v3.0 (AGPL-3.0)
+
+2. Tencent NCNN High-Performance Neural Network Inference Framework
+   Copyright (c) 2017-2026 Tencent Inc. All rights reserved.
+   Repository: https://github.com/Tencent/ncnn
+   License: BSD 3-Clause "New" or "Revised" License
+
+3. PNNX (PyTorch Neural Network Exchange)
+   Copyright (c) 2021-2026 Tencent Inc. All rights reserved.
+   Repository: https://github.com/pnnx/pnnx
+   License: BSD 3-Clause "New" or "Revised" License
+
+4. COCO Dataset Class Hierarchy
+   Copyright (c) 2014-2026 COCO Consortium
+   Website: https://cocodataset.org
+   License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+For full licensing details and notices of all third-party components,
+refer to THIRD_PARTY_LICENSES.md.
