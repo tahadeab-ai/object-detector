@@ -1,0 +1,13 @@
+[package]
+name = "yolo_ffi"
+version = "1.0.0"
+edition = "2021"
+authors = ["YOLO NCNN Detector Team"]
+description = "Staticlib C-ABI bridge exposing yolo_core to unified libyolo_ncnn.so"
+
+[lib]
+name = "yolo_rust"
+crate-type = ["staticlib"]
+
+[dependencies]
+yolo_core = { path = "../yolo_core" }

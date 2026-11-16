@@ -97,3 +97,8 @@ raw_logcat.txt
 benchmark_raw.txt
 .pytest_cache/
 __pycache__/
+
+# --- Third-Party Binary Archives ---
+*.zip
+*.tar.gz
+
