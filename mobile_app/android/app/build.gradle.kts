@@ -1,8 +1,17 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+val keystorePropertiesFile = rootProject.file("key.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
 android {
@@ -19,6 +28,18 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String?
+            keyPassword = keystoreProperties["keyPassword"] as String?
+            val storeFileName = keystoreProperties["storeFile"] as String?
+            if (storeFileName != null) {
+                storeFile = file(storeFileName)
+            }
+            storePassword = keystoreProperties["storePassword"] as String?
+        }
+    }
+
     defaultConfig {
         applicationId = "com.taha.yoloncnn"
         minSdk = 24
@@ -30,13 +51,36 @@ android {
             abiFilters.clear()
             abiFilters.add("arm64-v8a")
         }
+
+        externalNativeBuild {
+            cmake {
+                arguments("-DANDROID_STL=c++_shared")
+                abiFilters("arm64-v8a")
+            }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            excludes += "lib/armeabi-v7a/**"
+            excludes += "lib/x86/**"
+            excludes += "lib/x86_64/**"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("../../../native_core/CMakeLists.txt")
+        }
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (keystorePropertiesFile.exists() && keystoreProperties.containsKey("keyAlias")) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }

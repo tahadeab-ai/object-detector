@@ -25,7 +25,8 @@ class CocoClassInfo {
 }
 
 class CocoLabelsRepository {
-  static final CocoLabelsRepository _instance = CocoLabelsRepository._internal();
+  static final CocoLabelsRepository _instance =
+      CocoLabelsRepository._internal();
   factory CocoLabelsRepository() => _instance;
   CocoLabelsRepository._internal();
 

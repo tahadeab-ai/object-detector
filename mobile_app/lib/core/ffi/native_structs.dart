@@ -122,3 +122,21 @@ final class YoloFrameResult extends Struct {
   @Array(yoloMaxBoxes)
   external Array<YoloDetectionBox> boxes;
 }
+
+/// HARD GATE: Validates exact C-ABI struct sizes at runtime.
+/// Fails loudly with StateError on any struct layout drift.
+void enforceLayoutGate() {
+  final boxSize = sizeOf<YoloDetectionBox>();
+  final frameResultSize = sizeOf<YoloFrameResult>();
+
+  if (boxSize != 40) {
+    throw StateError(
+      'LAYOUT GATE FAILURE: sizeof(YoloDetectionBox) == $boxSize, expected 40 bytes',
+    );
+  }
+  if (frameResultSize != 4024) {
+    throw StateError(
+      'LAYOUT GATE FAILURE: sizeof(YoloFrameResult) == $frameResultSize, expected 4024 bytes',
+    );
+  }
+}

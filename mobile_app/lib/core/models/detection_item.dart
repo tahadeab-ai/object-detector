@@ -1,6 +1,7 @@
+import 'dart:ui';
 import '../ffi/native_structs.dart';
 
-/// Clean Dart representation of a tracked detection item
+/// Clean Dart representation of a tracked detection item with motion history
 class DetectionItem {
   final double x1;
   final double y1;
@@ -12,6 +13,8 @@ class DetectionItem {
   final TrackState trackState;
   final SpatialZone spatialZone;
   final ProximityTier proximityTier;
+  final double trackAgeSeconds;
+  final List<Offset> motionTrail;
 
   const DetectionItem({
     required this.x1,
@@ -24,9 +27,15 @@ class DetectionItem {
     required this.trackState,
     required this.spatialZone,
     required this.proximityTier,
+    this.trackAgeSeconds = 0.0,
+    this.motionTrail = const [],
   });
 
-  factory DetectionItem.fromNative(YoloDetectionBox box) {
+  factory DetectionItem.fromNative(
+    YoloDetectionBox box, {
+    double ageSeconds = 0.0,
+    List<Offset> trail = const [],
+  }) {
     return DetectionItem(
       x1: box.x1.clamp(0.0, 1.0),
       y1: box.y1.clamp(0.0, 1.0),
@@ -38,6 +47,8 @@ class DetectionItem {
       trackState: TrackState.fromInt(box.trackState),
       spatialZone: SpatialZone.fromInt(box.spatialZone),
       proximityTier: ProximityTier.fromInt(box.proximityTier),
+      trackAgeSeconds: ageSeconds,
+      motionTrail: trail,
     );
   }
 

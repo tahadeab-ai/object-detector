@@ -112,7 +112,9 @@ class _EngineSettingsSheetState extends State<EngineSettingsSheet> {
           // Go/Redis Telemetry Sync Switch
           SwitchListTile(
             title: Text(
-              widget.isArabic ? 'مزامنة قياسات Go/Redis' : 'Go/Redis Telemetry Sync',
+              widget.isArabic
+                  ? 'مزامنة قياسات Go/Redis'
+                  : 'Go/Redis Telemetry Sync',
               style: const TextStyle(color: Colors.white, fontSize: 14),
             ),
             subtitle: Text(

@@ -1,28 +1,52 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import '../../core/l10n/coco_labels_repository.dart';
+import '../../core/models/detection_item.dart';
 import '../../core/models/engine_telemetry.dart';
 
-/// Glassmorphic top telemetry HUD bar displaying FPS, latencies, and backend controls
+/// Glassmorphic top telemetry HUD bar with grouped object summary and latency breakdown
 class TelemetryTopBar extends StatelessWidget {
   final EngineTelemetry telemetry;
+  final List<DetectionItem> detections;
   final bool isArabic;
   final VoidCallback onToggleLanguage;
   final VoidCallback onToggleBackend;
   final VoidCallback onOpenSampleMode;
   final VoidCallback onOpenSettings;
+  final CocoLabelsRepository labelsRepo;
 
-  const TelemetryTopBar({
+  TelemetryTopBar({
     super.key,
     required this.telemetry,
+    required this.detections,
     required this.isArabic,
     required this.onToggleLanguage,
     required this.onToggleBackend,
     required this.onOpenSampleMode,
     required this.onOpenSettings,
-  });
+    CocoLabelsRepository? repo,
+  }) : labelsRepo = repo ?? CocoLabelsRepository();
+
+  Color _getFpsColor(double fps) {
+    if (fps >= 25.0) return const Color(0xFF34C759); // Green >= 25
+    if (fps >= 15.0) return const Color(0xFFFF9500); // Amber 15-24
+    return const Color(0xFFFF3B30); // Red < 15
+  }
+
+  Map<int, int> _getGroupedCounts() {
+    final map = <int, int>{};
+    for (final item in detections) {
+      if (item.isConfirmed) {
+        map[item.classId] = (map[item.classId] ?? 0) + 1;
+      }
+    }
+    return map;
+  }
 
   @override
   Widget build(BuildContext context) {
+    final grouped = _getGroupedCounts();
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: BackdropFilter(
@@ -30,23 +54,31 @@ class TelemetryTopBar extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.55),
+            color: Colors.black.withValues(alpha: 0.65),
             borderRadius: BorderRadius.circular(16),
             border: Border.all(color: Colors.white.withValues(alpha: 0.15)),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // 1. Primary Metrics Row: FPS + Latencies (Pre / NCNN / Track) + Backend
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  // Real-time FPS indicator
+                  // FPS Badge (color-coded)
                   _buildMetricPill(
                     icon: Icons.speed_rounded,
                     label: '${telemetry.fps.toStringAsFixed(1)} FPS',
-                    color: telemetry.fps >= 20.0
-                        ? const Color(0xFF34C759)
-                        : (telemetry.fps >= 10.0 ? const Color(0xFFFF9500) : const Color(0xFFFF3B30)),
+                    color: _getFpsColor(telemetry.fps),
+                  ),
+
+                  // Preprocess Latency
+                  _buildMetricPill(
+                    icon: Icons.aspect_ratio_rounded,
+                    label:
+                        '${telemetry.preProcessTimeMs.toStringAsFixed(1)} ms',
+                    sublabel: 'Pre',
+                    color: Colors.blueAccent,
                   ),
 
                   // NCNN Inference Latency
@@ -57,7 +89,7 @@ class TelemetryTopBar extends StatelessWidget {
                     color: Colors.cyanAccent,
                   ),
 
-                  // Rust Tracker Latency
+                  // NMS + Track Latency
                   _buildMetricPill(
                     icon: Icons.alt_route_rounded,
                     label: '${telemetry.trackerTimeMs.toStringAsFixed(1)} ms',
@@ -65,34 +97,43 @@ class TelemetryTopBar extends StatelessWidget {
                     color: Colors.amberAccent,
                   ),
 
-                  // Active Backend Badge / Button
+                  // CPU / Vulkan Backend Switch Pill
                   GestureDetector(
                     onTap: onToggleBackend,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 4),
                       decoration: BoxDecoration(
                         color: telemetry.isVulkan
                             ? Colors.purpleAccent.withValues(alpha: 0.3)
                             : Colors.blueAccent.withValues(alpha: 0.3),
                         borderRadius: BorderRadius.circular(8),
                         border: Border.all(
-                          color: telemetry.isVulkan ? Colors.purpleAccent : Colors.blueAccent,
+                          color: telemetry.isVulkan
+                              ? Colors.purpleAccent
+                              : Colors.blueAccent,
                         ),
                       ),
                       child: Row(
                         children: [
                           Icon(
-                            telemetry.isVulkan ? Icons.bolt_rounded : Icons.terminal_rounded,
+                            telemetry.isVulkan
+                                ? Icons.bolt_rounded
+                                : Icons.terminal_rounded,
                             size: 14,
-                            color: telemetry.isVulkan ? Colors.purpleAccent : Colors.blueAccent,
+                            color: telemetry.isVulkan
+                                ? Colors.purpleAccent
+                                : Colors.blueAccent,
                           ),
                           const SizedBox(width: 4),
                           Text(
-                            telemetry.isVulkan ? 'Vulkan' : 'CPU',
+                            telemetry.isVulkan ? 'Vulkan' : 'NEON 4T',
                             style: TextStyle(
-                              fontSize: 11,
+                              fontSize: 10,
                               fontWeight: FontWeight.bold,
-                              color: telemetry.isVulkan ? Colors.purpleAccent : Colors.blueAccent,
+                              color: telemetry.isVulkan
+                                  ? Colors.purpleAccent
+                                  : Colors.blueAccent,
                             ),
                           ),
                         ],
@@ -101,23 +142,54 @@ class TelemetryTopBar extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
-              // Secondary controls row
+
+              const SizedBox(height: 6),
+
+              // 2. Real-time Grouped Object Summary Strip
+              if (grouped.isNotEmpty)
+                Container(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.05),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: grouped.entries.map((entry) {
+                        final label =
+                            labelsRepo.getLabel(entry.key, isArabic: isArabic);
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: Text(
+                            '$label: ${entry.value}',
+                            style: const TextStyle(
+                              color: Colors.cyanAccent,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ),
+
+              // 3. Secondary Navigation & Action Row
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  // Active & confirmed tracks count
                   Text(
                     isArabic
-                        ? 'المسارات: ${telemetry.confirmedTracks} مؤكد / ${telemetry.activeTracks} إجمالي'
-                        : 'Tracks: ${telemetry.confirmedTracks} conf / ${telemetry.activeTracks} total',
+                        ? 'المسارات: ${telemetry.confirmedTracks} مؤكد / ${telemetry.activeTracks} نشط'
+                        : 'Tracks: ${telemetry.confirmedTracks} confirmed / ${telemetry.activeTracks} active',
                     style: const TextStyle(color: Colors.white70, fontSize: 11),
                   ),
-
-                  // Quick Action Buttons
                   Row(
                     children: [
-                      // Language Switcher (AR / EN)
+                      // Language Toggle
                       IconButton(
                         icon: Text(
                           isArabic ? 'EN' : 'عربي',
@@ -128,23 +200,28 @@ class TelemetryTopBar extends StatelessWidget {
                           ),
                         ),
                         padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(minWidth: 32, minHeight: 28),
+                        constraints:
+                            const BoxConstraints(minWidth: 32, minHeight: 28),
                         onPressed: onToggleLanguage,
                       ),
                       const SizedBox(width: 8),
-                      // Sample Benchmark Mode Button
+                      // Sample Benchmark Mode
                       IconButton(
-                        icon: const Icon(Icons.photo_library_outlined, size: 18, color: Colors.white),
+                        icon: const Icon(Icons.photo_library_outlined,
+                            size: 18, color: Colors.white),
                         padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints:
+                            const BoxConstraints(minWidth: 28, minHeight: 28),
                         onPressed: onOpenSampleMode,
                       ),
                       const SizedBox(width: 8),
-                      // Settings Sheet Button
+                      // Settings Sheet
                       IconButton(
-                        icon: const Icon(Icons.tune_rounded, size: 18, color: Colors.white),
+                        icon: const Icon(Icons.tune_rounded,
+                            size: 18, color: Colors.white),
                         padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints:
+                            const BoxConstraints(minWidth: 28, minHeight: 28),
                         onPressed: onOpenSettings,
                       ),
                     ],
@@ -165,7 +242,7 @@ class TelemetryTopBar extends StatelessWidget {
     required Color color,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(8),
@@ -173,8 +250,8 @@ class TelemetryTopBar extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 14, color: color),
-          const SizedBox(width: 5),
+          Icon(icon, size: 13, color: color),
+          const SizedBox(width: 4),
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
@@ -184,13 +261,13 @@ class TelemetryTopBar extends StatelessWidget {
                 style: TextStyle(
                   color: color,
                   fontWeight: FontWeight.bold,
-                  fontSize: 12,
+                  fontSize: 11,
                 ),
               ),
               if (sublabel != null)
                 Text(
                   sublabel,
-                  style: const TextStyle(color: Colors.white54, fontSize: 9),
+                  style: const TextStyle(color: Colors.white54, fontSize: 8),
                 ),
             ],
           ),

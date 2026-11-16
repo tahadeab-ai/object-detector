@@ -1,6 +1,7 @@
 /// Live telemetry metrics from the native detection and tracking loop
 class EngineTelemetry {
   final double fps;
+  final double preProcessTimeMs;
   final double inferenceTimeMs;
   final double trackerTimeMs;
   final double totalLatencyMs;
@@ -10,6 +11,7 @@ class EngineTelemetry {
 
   const EngineTelemetry({
     this.fps = 0.0,
+    this.preProcessTimeMs = 0.0,
     this.inferenceTimeMs = 0.0,
     this.trackerTimeMs = 0.0,
     this.totalLatencyMs = 0.0,
@@ -23,6 +25,7 @@ class EngineTelemetry {
 
   EngineTelemetry copyWith({
     double? fps,
+    double? preProcessTimeMs,
     double? inferenceTimeMs,
     double? trackerTimeMs,
     double? totalLatencyMs,
@@ -32,6 +35,7 @@ class EngineTelemetry {
   }) {
     return EngineTelemetry(
       fps: fps ?? this.fps,
+      preProcessTimeMs: preProcessTimeMs ?? this.preProcessTimeMs,
       inferenceTimeMs: inferenceTimeMs ?? this.inferenceTimeMs,
       trackerTimeMs: trackerTimeMs ?? this.trackerTimeMs,
       totalLatencyMs: totalLatencyMs ?? this.totalLatencyMs,

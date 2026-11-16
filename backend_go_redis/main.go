@@ -15,6 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var startTime = time.Now()
+
 // DetectionPayload represents a single detected object in the frame
 type DetectionPayload struct {
 	TrackID    int       `json:"track_id"`
@@ -28,15 +30,25 @@ type DetectionPayload struct {
 
 // FrameTelemetryPayload represents the complete frame event received from mobile app
 type FrameTelemetryPayload struct {
-	FrameID        int                `json:"frame_id"`
-	Timestamp      int64              `json:"timestamp"`
+	FrameID        int                `json:"frame_id,omitempty"`
+	Timestamp      int64              `json:"timestamp,omitempty"`
 	FPS            float64            `json:"fps"`
 	InferenceMS    float64            `json:"inference_ms"`
-	TrackerMS      float64            `json:"tracker_ms"`
-	TotalLatencyMS float64            `json:"total_latency_ms"`
+	TrackerMS      float64            `json:"tracker_ms,omitempty"`
+	TotalLatencyMS float64            `json:"total_latency_ms,omitempty"`
 	Backend        string             `json:"backend"`
-	TracksCount    int                `json:"tracks_count"`
-	Detections     []DetectionPayload `json:"detections"`
+	TracksCount    int                `json:"tracks_count,omitempty"`
+	Detections     []DetectionPayload `json:"detections,omitempty"`
+}
+
+// BatchTelemetryRequest represents the batched JSON payload per P4.1
+type BatchTelemetryRequest struct {
+	DeviceModel     string                  `json:"device_model"`
+	Backend         string                  `json:"backend"`
+	FPS             float64                 `json:"fps"`
+	InferenceMS     float64                 `json:"inference_ms"`
+	DetectedClasses []int                   `json:"detected_classes"`
+	Frames          []FrameTelemetryPayload `json:"frames,omitempty"`
 }
 
 // TelemetryHub manages WebSocket client connections and live broadcasts
@@ -91,18 +103,31 @@ func setupApp(rdb *redis.Client, hub *TelemetryHub) *fiber.App {
 
 	app.Use(cors.New())
 
-	// Healthcheck endpoint
+	// 1. GET /health (Redis ping + uptime)
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
+		uptime := time.Since(startTime).Truncate(time.Second).String()
+		redisStatus := "disconnected"
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			if err := rdb.Ping(ctx).Err(); err == nil {
+				redisStatus = "connected"
+			}
+		}
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
 			"status":    "healthy",
+			"uptime":    uptime,
+			"redis":     redisStatus,
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 			"service":   "yolo-telemetry",
 		})
 	})
 
-	// Telemetry ingestion endpoint from mobile client
-	app.Post("/api/telemetry", func(c *fiber.Ctx) error {
-		var payload FrameTelemetryPayload
+	// 2. POST /api/v1/telemetry (batched JSON: device_model, backend, fps, inference_ms, detected_classes)
+	app.Post("/api/v1/telemetry", func(c *fiber.Ctx) error {
+		var payload BatchTelemetryRequest
 		if err := c.BodyParser(&payload); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fiber.Map{
@@ -114,50 +139,53 @@ func setupApp(rdb *redis.Client, hub *TelemetryHub) *fiber.App {
 
 		rawBytes, _ := json.Marshal(payload)
 
-		// Broadcast to connected WebSocket clients
+		// Broadcast to WebSocket clients
 		select {
 		case hub.broadcast <- rawBytes:
 		default:
 		}
 
-		// Push to Redis Streams if Redis is connected
+		// Store in Redis Stream and Sorted Set
 		if rdb != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 			defer cancel()
+
+			classesJSON, _ := json.Marshal(payload.DetectedClasses)
 
 			_ = rdb.XAdd(ctx, &redis.XAddArgs{
 				Stream: "yolo:telemetry",
 				Values: map[string]interface{}{
-					"frame_id":  payload.FrameID,
-					"fps":       payload.FPS,
-					"latency":   payload.TotalLatencyMS,
-					"tracks":    payload.TracksCount,
-					"payload":   string(rawBytes),
-					"timestamp": payload.Timestamp,
+					"device_model":     payload.DeviceModel,
+					"backend":          payload.Backend,
+					"fps":              payload.FPS,
+					"inference_ms":     payload.InferenceMS,
+					"detected_classes": string(classesJSON),
+					"timestamp":        time.Now().UnixMilli(),
 				},
 			}).Err()
 
-			// Increment class counts in Redis Sorted Set
-			for _, det := range payload.Detections {
-				_ = rdb.ZIncrBy(ctx, "yolo:class_counts", 1.0, fmt.Sprintf("%d", det.ClassID)).Err()
+			// Increment class counts in Redis Sorted Set: yolo:class_counts
+			for _, classID := range payload.DetectedClasses {
+				_ = rdb.ZIncrBy(ctx, "yolo:class_counts", 1.0, fmt.Sprintf("%d", classID)).Err()
 			}
 		}
 
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"status":   "received",
-			"frame_id": payload.FrameID,
+			"status":       "received",
+			"device_model": payload.DeviceModel,
+			"backend":      payload.Backend,
 		})
 	})
 
-	// WebSocket streaming endpoint for web dashboards
-	app.Use("/ws", func(c *fiber.Ctx) error {
+	// 3. WS /ws/telemetry
+	app.Use("/ws/telemetry", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
 		}
 		return fiber.ErrUpgradeRequired
 	})
 
-	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
+	app.Get("/ws/telemetry", websocket.New(func(c *websocket.Conn) {
 		hub.register <- c
 		defer func() {
 			hub.unregister <- c
@@ -170,6 +198,46 @@ func setupApp(rdb *redis.Client, hub *TelemetryHub) *fiber.App {
 			}
 		}
 	}))
+
+	// 4. GET /api/v1/analytics/summary (reading ZREVRANGEWITHSCORES yolo:class_counts 0 19 and XREVRANGE yolo:telemetry + - COUNT 50)
+	app.Get("/api/v1/analytics/summary", func(c *fiber.Ctx) error {
+		topClasses := []fiber.Map{}
+		recentTelemetry := []fiber.Map{}
+
+		if rdb != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+			defer cancel()
+
+			// ZREVRANGEWITHSCORES yolo:class_counts 0 19
+			zRes, err := rdb.ZRevRangeWithScores(ctx, "yolo:class_counts", 0, 19).Result()
+			if err == nil {
+				for _, z := range zRes {
+					topClasses = append(topClasses, fiber.Map{
+						"class_id": z.Member,
+						"count":    int64(z.Score),
+					})
+				}
+			}
+
+			// XREVRANGE yolo:telemetry + - COUNT 50
+			xRes, err := rdb.XRevRangeN(ctx, "yolo:telemetry", "+", "-", 50).Result()
+			if err == nil {
+				for _, msg := range xRes {
+					recentTelemetry = append(recentTelemetry, fiber.Map{
+						"id":     msg.ID,
+						"values": msg.Values,
+					})
+				}
+			}
+		}
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"status":           "success",
+			"top_classes":      topClasses,
+			"recent_telemetry": recentTelemetry,
+			"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		})
+	})
 
 	return app
 }
