@@ -93,6 +93,7 @@ pub fn decode_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::YOLO_MAX_BOXES;
 
     #[test]
     fn test_decoder_synthetic_tensor() {
