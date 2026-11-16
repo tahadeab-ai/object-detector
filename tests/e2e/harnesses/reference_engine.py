@@ -405,3 +405,22 @@ def validate_model_metadata(param_content: str, metadata_dict: Dict) -> int:
         return -104
 
     return 0
+
+
+class BilingualCocoRepository:
+    """Bilingual COCO label repository supporting English and Arabic lookups."""
+
+    def __init__(self, labels_path: Optional[str] = None):
+        if labels_path is None:
+            from pathlib import Path
+            labels_path = Path(__file__).resolve().parent.parent / "fixtures" / "labels" / "valid_coco80_labels.json"
+        import json
+        with open(labels_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.labels = {item["id"]: item for item in data}
+
+    def get_label(self, class_id: int, locale: str = "en") -> str:
+        item = self.labels.get(class_id, {})
+        key = f"name_{locale}"
+        return item.get(key, item.get("name_en", "unknown"))
+

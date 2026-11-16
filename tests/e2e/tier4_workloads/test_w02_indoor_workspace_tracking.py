@@ -66,7 +66,7 @@ def test_w02_indoor_office_asset_tracking_and_proximity_shift():
         Detection(230, 230, 260, 270, conf=0.79, class_id=41),
     ])
     tracker.update([
-        Detection(80, 160, 240, 320, conf=0.92, class_id=63),
+        Detection(70, 150, 250, 380, conf=0.92, class_id=63),
         Detection(180, 220, 210, 250, conf=0.82, class_id=67),
         Detection(300, 150, 420, 350, conf=0.91, class_id=56),
         Detection(230, 230, 260, 270, conf=0.79, class_id=41),

@@ -8,6 +8,17 @@ import time
 from typing import Dict, Any, List, Optional
 from collections import deque
 
+class PayloadDict(dict):
+    """Dictionary supporting both item and attribute access."""
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError:
+            raise AttributeError(item)
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
 class TelemetryPayload:
     """Represents a validated telemetry packet sent from mobile client to microservice."""
     def __init__(self, frame_id: int, fps: float, preprocess_ms: float,
@@ -23,7 +34,7 @@ class TelemetryPayload:
         self.timestamp = timestamp or time.time()
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        return PayloadDict({
             "frame_id": self.frame_id,
             "fps": round(self.fps, 2),
             "preprocess_ms": round(self.preprocess_ms, 2),
@@ -32,7 +43,7 @@ class TelemetryPayload:
             "detected_classes": self.detected_classes,
             "backend": self.backend,
             "timestamp": self.timestamp
-        }
+        })
 
     def validate(self) -> bool:
         if self.fps < 0.0 or self.fps > 240.0:
@@ -52,6 +63,7 @@ class MockRedisTelemetryService:
         self.redis_connected = True
         self.uptime_start = time.time()
         self.telemetry_stream: List[Dict[str, Any]] = [] # simulates yolo:telemetry
+        self.stream_data: List[Dict[str, Any]] = []      # raw payload history for Tier 4 suites
         self.class_counts: Dict[int, int] = {}           # simulates yolo:class_counts sorted set
         self.max_stream_len = 100000
         self.simulated_latency_sec = 0.0
@@ -66,6 +78,9 @@ class MockRedisTelemetryService:
         }
 
     def post_telemetry(self, payload_dict: Dict[str, Any]) -> (int, Dict[str, Any]):
+        if not self.redis_connected:
+            return 503, {"error": "Redis disconnected"}
+
         if self.simulated_latency_sec > 0:
             time.sleep(self.simulated_latency_sec)
 
@@ -81,9 +96,12 @@ class MockRedisTelemetryService:
 
         # Append to stream with approximate capping
         stream_id = f"{int(time.time() * 1000)}-0"
+        self.stream_data.append(payload_dict)
         self.telemetry_stream.append({"id": stream_id, "data": payload_dict})
         if len(self.telemetry_stream) > self.max_stream_len:
             self.telemetry_stream.pop(0)
+        if len(self.stream_data) > self.max_stream_len:
+            self.stream_data.pop(0)
 
         # Update sorted set yolo:class_counts
         for cls_id in payload_dict.get("detected_classes", []):

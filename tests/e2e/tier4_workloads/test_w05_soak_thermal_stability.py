@@ -108,7 +108,7 @@ def test_w15_clean_machine_release_apk_validation():
     assert engine.initialized is True
 
     # Check that expected symbols exist in C-ABI harness
-    assert len(EXPECTED_C_ABI_SYMBOLS) == 6
+    assert len(EXPECTED_C_ABI_SYMBOLS) == 7
     assert "yolo_engine_init" in EXPECTED_C_ABI_SYMBOLS
     assert "yolo_engine_forward_yuv420" in EXPECTED_C_ABI_SYMBOLS
     assert "yolo_engine_reset_tracker" in EXPECTED_C_ABI_SYMBOLS

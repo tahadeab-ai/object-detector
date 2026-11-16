@@ -18,14 +18,13 @@ Write-Host "--- adb devices -l output ---"
 Write-Host $devicesOutput
 
 # 3. Verify Serial Presence and 'device' State
-$deviceLines = ($devicesOutput -split [Environment]::NewLine) | Where-Object { $_ -match $expectedSerial }
+$lines = ($devicesOutput -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 }
+$matchedLine = $lines | Where-Object { $_ -match $expectedSerial } | Select-Object -First 1
 
-if (-not $deviceLines) {
+if (-not $matchedLine) {
     Write-Host "STATUS: WAITING_FOR_PHYSICAL_DEVICE"
     throw "FATAL: Physical device with serial '$expectedSerial' is not attached! (RESTORE-4: Emulators strictly forbidden)."
 }
-
-$matchedLine = $deviceLines[0]
 if ($matchedLine -match '\bunauthorized\b') {
     throw "FATAL: Device '$expectedSerial' is attached but UNAUTHORIZED. Please accept the USB debugging prompt on the phone screen."
 }

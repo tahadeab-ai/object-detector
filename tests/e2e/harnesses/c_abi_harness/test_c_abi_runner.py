@@ -82,7 +82,7 @@ class MockNativeYoloEngine:
         self.backend = 0
         self.input_size = 640
 
-    def yolo_engine_init(self, param_path: str, bin_path: str, input_size: int, use_vulkan: bool) -> int:
+    def yolo_engine_init(self, param_path: str, bin_path: str, input_size: int = 640, use_vulkan: bool = False) -> int:
         if not os.path.exists(param_path):
             return -101
         if not os.path.exists(bin_path):

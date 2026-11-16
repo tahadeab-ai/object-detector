@@ -203,8 +203,8 @@ def test_w18_mixed_class_crossing_bicycle_pedestrian():
     # Cyclist rides leftwards (450 -> 150)
     for f in range(3): # Form tracks
         tracker.update([
-            Detection(150 + f * 5, 200, 190 + f * 5, 300, conf=0.90, class_id=0),
-            Detection(450 - f * 10, 210, 510 - f * 10, 290, conf=0.92, class_id=1),
+            Detection(150 + f * 15, 200, 190 + f * 15, 300, conf=0.90, class_id=0),
+            Detection(450 - f * 20, 210, 510 - f * 20, 290, conf=0.92, class_id=1),
         ])
 
     assert len(tracker.tracks) == 2
@@ -214,7 +214,7 @@ def test_w18_mixed_class_crossing_bicycle_pedestrian():
     # Crossing phase (frames where they intersect around cx=300)
     for f in range(3, 12):
         ped_x = 150 + f * 15
-        bike_x = 450 - f * 25
+        bike_x = 450 - f * 20
         tracker.update([
             Detection(ped_x, 200, ped_x + 40, 300, conf=0.88, class_id=0),
             Detection(bike_x, 210, bike_x + 60, 290, conf=0.89, class_id=1),
