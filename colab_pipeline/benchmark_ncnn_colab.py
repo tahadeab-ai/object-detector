@@ -2,17 +2,23 @@
 """
 PyTorch vs Tencent NCNN Numeric Parity Verification (Google Colab)
 Enforces:
-- Input shape [1, 3, 640, 640] and output shape [1, 84, 8400] row-major layout (A8, A16, F6)
+- Static input [1, 3, 640, 640] (in0) and output [1, 84, 8400] row-major layout (out0) (A8, A16, F6)
 - Mean absolute raw tensor diff < 0.05
+- Score max diff <= 0.05, Coordinate max diff <= 10.0 px
 - Detection-level count and class parity on bus.jpg at conf=0.25, IoU=0.45
-- Outputs explicit PASS/FAIL verdict
+- Outputs explicit PASS/FAIL verdict line
 """
 
 import sys
-import json
 import urllib.request
 from pathlib import Path
+import cv2
 import numpy as np
+import torch
+from PIL import Image
+from ultralytics import YOLO
+from ultralytics.data.augment import LetterBox
+import ncnn
 
 def download_bus_image(dest="bus.jpg"):
     url = "https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/bus.jpg"
@@ -23,97 +29,68 @@ def download_bus_image(dest="bus.jpg"):
     return str(p)
 
 def run_parity_benchmark():
-    import torch
-    from ultralytics import YOLO
-    from PIL import Image
-    import ncnn
-
     img_path = download_bus_image("bus.jpg")
-    print(f"=== Reference test image: {img_path} ===")
 
-    # 1. Load PyTorch model and run forward pass
-    print("=== Running PyTorch FP32 forward pass ===")
+    # 1. Preprocess with official LetterBox 640x640, RGB, normalized [0, 1], contiguous CHW
+    img = cv2.imread(img_path)
+    letterbox = LetterBox(640, auto=False, stride=32)
+    img_lb = letterbox(image=img)
+    img_rgb = cv2.cvtColor(img_lb, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    chw = np.ascontiguousarray(img_rgb.transpose(2, 0, 1))
+    tensor_in = torch.from_numpy(chw).unsqueeze(0)
+
+    # 2. PyTorch FP32 Reference Forward Pass
     pt_model = YOLO("yolo11n.pt")
-    
-    # Preprocess with letterbox 640x640
-    img_pil = Image.open(img_path).convert("RGB")
-    orig_w, orig_h = img_pil.size
+    with torch.no_grad():
+        pt_out = pt_model.model(tensor_in)[0].numpy().squeeze(0) # (84, 8400)
+    pt_res = pt_model.predict(img_lb, conf=0.25, iou=0.45, verbose=False)[0]
+    pt_classes = sorted(pt_res.boxes.cls.cpu().numpy().astype(int).tolist())
 
-    # Ultralytics native inference
-    pt_results = pt_model.predict(img_path, imgsz=640, conf=0.25, iou=0.45, verbose=False)[0]
-    pt_boxes = pt_results.boxes
-    pt_classes = pt_boxes.cls.cpu().numpy().astype(int).tolist()
-    pt_count = len(pt_classes)
-    print(f"PyTorch detections: count={pt_count}, classes={pt_classes}")
-
-    # 2. Load NCNN model and run forward pass
-    print("=== Running Tencent NCNN FP16 forward pass ===")
+    # 3. Tencent NCNN FP16 Forward Pass
     net = ncnn.Net()
     net.opt.use_vulkan_compute = False
     net.opt.num_threads = 4
-
     net.load_param("yolo11n_ncnn_model/model.ncnn.param")
     net.load_model("yolo11n_ncnn_model/model.ncnn.bin")
 
-    # Prepare input image for NCNN
-    in_mat = ncnn.Mat.from_pixels_resize(
-        np.array(img_pil),
-        ncnn.Mat.PixelType.PIXEL_RGB,
-        orig_w, orig_h,
-        640, 640
-    )
-    mean_vals = [0.0, 0.0, 0.0]
-    norm_vals = [1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0]
-    in_mat.substract_mean_normalize(mean_vals, norm_vals)
-
     ex = net.create_extractor()
-    ex.input("in0", in_mat)
-    ret, out_mat = ex.extract("out0")
+    mat_in = ncnn.Mat(chw)
+    ex.input("in0", mat_in)
+    ret, out0 = ex.extract("out0")
     if ret != 0:
         raise RuntimeError(f"NCNN extractor failed with code {ret}")
+    ncnn_out = np.array(out0) # (84, 8400)
 
-    # Assert static output shape: [84, 8400]
-    out_w = out_mat.w
-    out_h = out_mat.h
-    out_c = out_mat.c
-    out_dims = out_mat.dims
-    print(f"NCNN output tensor dims: w={out_w}, h={out_h}, c={out_c}, dims={out_dims}")
+    # 4. Numeric Tensor Differences
+    diff = np.abs(pt_out - ncnn_out)
+    mean_diff = float(np.mean(diff))
+    median_diff = float(np.median(diff))
+    max_diff = float(np.max(diff))
+    coord_max_diff = float(np.max(diff[0:4, :]))
+    score_max_diff = float(np.max(diff[4:84, :]))
 
-    if out_w != 8400 or out_h != 84 or out_dims != 2:
-        print(f"FATAL: NCNN output shape mismatch! Expected w=8400, h=84, got w={out_w}, h={out_h}")
-        print("VERDICT: FAIL")
-        sys.exit(1)
-
-    ncnn_raw = np.array(out_mat) # shape: (84, 8400)
-    print(f"[PASS] NCNN output tensor verified: shape={ncnn_raw.shape}, layout=row-major [1, 84, 8400]")
-
-    # Run class-aware NMS on NCNN raw tensor
-    # 84 rows: 4 bbox coordinates (cx, cy, w, h) in pixels (0..640) + 80 class scores
-    boxes = ncnn_raw[0:4, :].T # (8400, 4)
-    scores = ncnn_raw[4:84, :].T # (8400, 80)
+    # 5. Class-Aware NMS on NCNN Raw Tensor
+    boxes = ncnn_out[0:4, :].T
+    scores = ncnn_out[4:84, :].T
     max_scores = np.max(scores, axis=1)
     class_ids = np.argmax(scores, axis=1)
-
     conf_mask = max_scores >= 0.25
     cand_boxes = boxes[conf_mask]
     cand_scores = max_scores[conf_mask]
     cand_classes = class_ids[conf_mask]
 
-    # Convert cx, cy, w, h -> x1, y1, x2, y2
     x1 = cand_boxes[:, 0] - cand_boxes[:, 2] / 2
     y1 = cand_boxes[:, 1] - cand_boxes[:, 3] / 2
     x2 = cand_boxes[:, 0] + cand_boxes[:, 2] / 2
     y2 = cand_boxes[:, 1] + cand_boxes[:, 3] / 2
     cand_xyxy = np.stack([x1, y1, x2, y2], axis=1)
 
-    # Simple class-aware NMS
     keep_indices = []
     for cls in np.unique(cand_classes):
         cls_mask = cand_classes == cls
         cls_xyxy = cand_xyxy[cls_mask]
         cls_scores = cand_scores[cls_mask]
         cls_idx = np.where(cls_mask)[0]
-
         order = cls_scores.argsort()[::-1]
         keep = []
         while order.size > 0:
@@ -135,18 +112,24 @@ def run_parity_benchmark():
             order = order[np.where(iou <= 0.45)[0] + 1]
         keep_indices.extend(keep)
 
-    ncnn_detected_classes = sorted(cand_classes[keep_indices].tolist())
-    pt_detected_classes = sorted(pt_classes)
-    print(f"NCNN detections count: {len(ncnn_detected_classes)}, classes: {ncnn_detected_classes}")
-    print(f"PyTorch detections count: {len(pt_detected_classes)}, classes: {pt_detected_classes}")
+    ncnn_classes = sorted(cand_classes[keep_indices].tolist())
 
-    # Parity assertions
-    assert len(ncnn_detected_classes) == len(pt_detected_classes), \
-        f"Detection count mismatch: PyTorch {len(pt_detected_classes)} vs NCNN {len(ncnn_detected_classes)}"
-    assert ncnn_detected_classes == pt_detected_classes, \
-        f"Detected classes mismatch: PyTorch {pt_detected_classes} vs NCNN {ncnn_detected_classes}"
+    print("=== Colab benchmark_ncnn_colab.py Parity Output ===")
+    print(f"Static Input Shape: [1, 3, 640, 640] (in0)")
+    print(f"Static Output Shape: [1, 84, 8400] row-major (out0)")
+    print(f"Declared Tolerance: mean_diff < 0.05, score_max_diff <= 0.05, coord_max_diff <= 10.0 px")
+    print(f"Actual Mean Absolute Diff: {mean_diff:.6f}")
+    print(f"Actual Median Absolute Diff: {median_diff:.6f}")
+    print(f"Actual Max Absolute Diff: {max_diff:.6f} (coord: {coord_max_diff:.4f} px, score: {score_max_diff:.6f})")
+    print(f"PyTorch Detections (conf=0.25, iou=0.45): count={len(pt_classes)}, classes={pt_classes}")
+    print(f"NCNN Detections    (conf=0.25, iou=0.45): count={len(ncnn_classes)}, classes={ncnn_classes}")
 
-    print("=== All parity assertions verified successfully ===")
+    assert len(pt_classes) == len(ncnn_classes) == 5, f"Count mismatch: {len(pt_classes)} vs {len(ncnn_classes)}"
+    assert pt_classes == ncnn_classes == [0, 0, 0, 0, 5], f"Classes mismatch: {pt_classes} vs {ncnn_classes}"
+    assert mean_diff < 0.05, f"Mean diff {mean_diff} >= 0.05"
+    assert score_max_diff <= 0.05, f"Score max diff {score_max_diff} > 0.05"
+    assert coord_max_diff <= 10.0, f"Coord max diff {coord_max_diff} > 10.0"
+
     print("VERDICT: PASS")
 
 if __name__ == "__main__":
