@@ -7,6 +7,12 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <android/log.h>
+
+#define LOG_TAG "YoloNcnnNative"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -48,8 +54,11 @@ struct EngineContext {
     ncnn::Net net;
     std::string in_blob_name = "in0";
     std::string out_blob_name = "out0";
+    std::string param_path;
+    std::string bin_path;
     int active_backend = 0; // 0=CPU, 1=Vulkan
     bool initialized = false;
+    bool gpu_instance_created = false;
     uint32_t frame_counter = 0;
 
     // Fixed static scratch buffers to guarantee ZERO heap allocation per frame
@@ -60,6 +69,7 @@ struct EngineContext {
 };
 
 static EngineContext g_ctx;
+static std::mutex g_engine_mutex;
 
 // Helper: parse model.ncnn.param to extract dynamic input and output blob names
 void parse_param_blob_names(const char* param_path, std::string& in_name, std::string& out_name) {
@@ -135,55 +145,131 @@ inline void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t* r, uint8_t* g, 
 extern "C" {
 
 int yolo_engine_init(const char* param_path, const char* bin_path, int use_vulkan) {
-    if (!param_path || !bin_path) return -1;
+    if (!param_path || !bin_path) {
+        LOGE("yolo_engine_init: null paths passed");
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    g_ctx.param_path = param_path;
+    g_ctx.bin_path = bin_path;
+
+    // Parse blob names dynamically from param
+    parse_param_blob_names(param_path, g_ctx.in_blob_name, g_ctx.out_blob_name);
+    LOGI("yolo_engine_init: in_blob=%s, out_blob=%s", g_ctx.in_blob_name.c_str(), g_ctx.out_blob_name.c_str());
 
     g_ctx.net.clear();
     g_ctx.net.opt = ncnn::Option();
-    g_ctx.net.opt.num_threads = 4;
+    g_ctx.net.opt.num_threads = 1;
     g_ctx.net.opt.use_fp16_packed = true;
     g_ctx.net.opt.use_fp16_storage = true;
     g_ctx.net.opt.use_fp16_arithmetic = true;
-
     g_ctx.active_backend = 0;
+
 #if NCNN_VULKAN
+    if (!g_ctx.gpu_instance_created) {
+        ncnn::create_gpu_instance();
+        g_ctx.gpu_instance_created = true;
+    }
+
     if (use_vulkan && ncnn::get_gpu_count() > 0) {
         g_ctx.net.opt.use_vulkan_compute = true;
         g_ctx.net.set_vulkan_device(0);
         g_ctx.active_backend = 1;
+        LOGI("yolo_engine_init: Vulkan compute enabled on device 0 (GPU count: %d)", ncnn::get_gpu_count());
     } else {
         g_ctx.net.opt.use_vulkan_compute = false;
         g_ctx.active_backend = 0;
+        LOGI("yolo_engine_init: CPU backend selected");
     }
 #else
     g_ctx.net.opt.use_vulkan_compute = false;
     g_ctx.active_backend = 0;
+    LOGI("yolo_engine_init: CPU backend selected (NCNN_VULKAN off)");
 #endif
 
-    // Parse blob names dynamically from param
-    parse_param_blob_names(param_path, g_ctx.in_blob_name, g_ctx.out_blob_name);
-
     int ret_param = g_ctx.net.load_param(param_path);
-    if (ret_param != 0) return -2;
+    int ret_bin = (ret_param == 0) ? g_ctx.net.load_model(bin_path) : -1;
 
-    int ret_bin = g_ctx.net.load_model(bin_path);
-    if (ret_bin != 0) return -3;
+#if NCNN_VULKAN
+    if ((ret_param != 0 || ret_bin != 0) && g_ctx.active_backend == 1) {
+        LOGE("yolo_engine_init: Vulkan load failed (param=%d, bin=%d), falling back to CPU", ret_param, ret_bin);
+        g_ctx.net.clear();
+        g_ctx.net.opt.use_vulkan_compute = false;
+        g_ctx.active_backend = 0;
+        ret_param = g_ctx.net.load_param(param_path);
+        ret_bin = g_ctx.net.load_model(bin_path);
+    }
+#endif
+
+    if (ret_param != 0) {
+        LOGE("yolo_engine_init: load_param failed (%d)", ret_param);
+        return -2;
+    }
+    if (ret_bin != 0) {
+        LOGE("yolo_engine_init: load_model failed (%d)", ret_bin);
+        return -3;
+    }
 
     yolo_rust_init();
 
     g_ctx.initialized = true;
     g_ctx.frame_counter = 0;
+    LOGI("yolo_engine_init: SUCCESS, active_backend=%d", g_ctx.active_backend);
     return 0;
 }
 
 int yolo_engine_set_backend(int use_vulkan) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (!g_ctx.initialized) return -1;
+    if (g_ctx.active_backend == use_vulkan) {
+        return g_ctx.active_backend;
+    }
+
 #if NCNN_VULKAN
+    if (!g_ctx.gpu_instance_created) {
+        ncnn::create_gpu_instance();
+        g_ctx.gpu_instance_created = true;
+    }
+
     if (use_vulkan && ncnn::get_gpu_count() > 0) {
+        LOGI("yolo_engine_set_backend: Reloading net with Vulkan GPU...");
+        g_ctx.net.clear();
+        g_ctx.net.opt = ncnn::Option();
+        g_ctx.net.opt.num_threads = 1;
+        g_ctx.net.opt.use_fp16_packed = true;
+        g_ctx.net.opt.use_fp16_storage = true;
+        g_ctx.net.opt.use_fp16_arithmetic = true;
         g_ctx.net.opt.use_vulkan_compute = true;
+        g_ctx.net.set_vulkan_device(0);
         g_ctx.active_backend = 1;
+
+        int rp = g_ctx.net.load_param(g_ctx.param_path.c_str());
+        int rb = g_ctx.net.load_model(g_ctx.bin_path.c_str());
+        if (rp != 0 || rb != 0) {
+            LOGE("yolo_engine_set_backend: Vulkan reload failed (rp=%d, rb=%d), falling back to CPU", rp, rb);
+            g_ctx.net.clear();
+            g_ctx.net.opt.use_vulkan_compute = false;
+            g_ctx.active_backend = 0;
+            g_ctx.net.load_param(g_ctx.param_path.c_str());
+            g_ctx.net.load_model(g_ctx.bin_path.c_str());
+        } else {
+            LOGI("yolo_engine_set_backend: Vulkan backend active");
+        }
     } else {
+        LOGI("yolo_engine_set_backend: Reloading net with CPU...");
+        g_ctx.net.clear();
+        g_ctx.net.opt = ncnn::Option();
+        g_ctx.net.opt.num_threads = 1;
+        g_ctx.net.opt.use_fp16_packed = true;
+        g_ctx.net.opt.use_fp16_storage = true;
+        g_ctx.net.opt.use_fp16_arithmetic = true;
         g_ctx.net.opt.use_vulkan_compute = false;
         g_ctx.active_backend = 0;
+        g_ctx.net.load_param(g_ctx.param_path.c_str());
+        g_ctx.net.load_model(g_ctx.bin_path.c_str());
+        LOGI("yolo_engine_set_backend: CPU backend active");
     }
     return g_ctx.active_backend;
 #else
@@ -208,6 +294,15 @@ int yolo_engine_forward_yuv420(
     if (!g_ctx.initialized || !out_result) return -1;
     if (!y_plane || !u_plane || !v_plane) return -2;
     if (width <= 0 || height <= 0) return -3;
+
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    uint8_t min_y = 255, max_y = 0;
+    for (int i = 0; i < std::min(1000, width * height); ++i) {
+        if (y_plane[i] < min_y) min_y = y_plane[i];
+        if (y_plane[i] > max_y) max_y = y_plane[i];
+    }
+    LOGE("y_plane check: w=%d, h=%d, min_y=%d, max_y=%d", width, height, min_y, max_y);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -258,13 +353,41 @@ int yolo_engine_forward_yuv420(
     ncnn::Mat out_mat;
     int ret = ex.extract(g_ctx.out_blob_name.c_str(), out_mat);
     if (ret != 0) {
-        out_result->status_code = ret;
-        return -4;
+#if NCNN_VULKAN
+        if (g_ctx.active_backend == 1) {
+            LOGE("NCNN extract failed on Vulkan (%d), falling back to CPU", ret);
+            g_ctx.net.clear();
+            g_ctx.net.opt.use_vulkan_compute = false;
+            g_ctx.active_backend = 0;
+            g_ctx.net.load_param(g_ctx.param_path.c_str());
+            g_ctx.net.load_model(g_ctx.bin_path.c_str());
+            ncnn::Extractor ex_cpu = g_ctx.net.create_extractor();
+            ex_cpu.input(g_ctx.in_blob_name.c_str(), in_mat);
+            ret = ex_cpu.extract(g_ctx.out_blob_name.c_str(), out_mat);
+        }
+#endif
+        if (ret != 0) {
+            LOGE("NCNN extract failed (%d)", ret);
+            out_result->status_code = ret;
+            return -4;
+        }
     }
 
     // Copy raw output tensor [84, 8400] to pre-allocated float buffer
     // out_mat: w=8400, h=84
     memcpy(g_ctx.raw_output_tensor, (const float*)out_mat.data, 84 * 8400 * sizeof(float));
+
+    float max_a = 0.0f, max_b = 0.0f;
+    for (int a = 0; a < 8400; ++a) {
+        for (int c = 0; c < 80; ++c) {
+            float sa = g_ctx.raw_output_tensor[(4 + c) * 8400 + a];
+            if (sa > max_a) max_a = sa;
+            float sb = g_ctx.raw_output_tensor[a * 84 + (4 + c)];
+            if (sb > max_b) max_b = sb;
+        }
+    }
+    LOGE("out_mat: dims=%d, w=%d, h=%d, c=%d, cstep=%d, max_a=%f, max_b=%f",
+         out_mat.dims, out_mat.w, out_mat.h, out_mat.c, (int)out_mat.cstep, max_a, max_b);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     float inference_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
@@ -288,6 +411,9 @@ int yolo_engine_forward_yuv420(
     out_result->active_backend = g_ctx.active_backend;
     out_result->status_code = rust_ret;
 
+    LOGE("yolo_forward: ret=%d, num_detections=%d, inf=%.1fms, track=%.1fms",
+         rust_ret, out_result->num_detections, inference_ms, tracker_ms);
+
     return 0;
 }
 
@@ -300,6 +426,8 @@ int yolo_engine_forward_rgba(
 ) {
     if (!g_ctx.initialized || !out_result) return -1;
     if (!rgba || width <= 0 || height <= 0) return -2;
+
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -338,11 +466,39 @@ int yolo_engine_forward_rgba(
     ncnn::Mat out_mat;
     int ret = ex.extract(g_ctx.out_blob_name.c_str(), out_mat);
     if (ret != 0) {
-        out_result->status_code = ret;
-        return -4;
+#if NCNN_VULKAN
+        if (g_ctx.active_backend == 1) {
+            LOGE("NCNN extract failed on Vulkan (%d), falling back to CPU", ret);
+            g_ctx.net.clear();
+            g_ctx.net.opt.use_vulkan_compute = false;
+            g_ctx.active_backend = 0;
+            g_ctx.net.load_param(g_ctx.param_path.c_str());
+            g_ctx.net.load_model(g_ctx.bin_path.c_str());
+            ncnn::Extractor ex_cpu = g_ctx.net.create_extractor();
+            ex_cpu.input(g_ctx.in_blob_name.c_str(), in_mat);
+            ret = ex_cpu.extract(g_ctx.out_blob_name.c_str(), out_mat);
+        }
+#endif
+        if (ret != 0) {
+            LOGE("NCNN extract failed (%d)", ret);
+            out_result->status_code = ret;
+            return -4;
+        }
     }
 
     memcpy(g_ctx.raw_output_tensor, (const float*)out_mat.data, 84 * 8400 * sizeof(float));
+
+    float max_a = 0.0f, max_b = 0.0f;
+    for (int a = 0; a < 8400; ++a) {
+        for (int c = 0; c < 80; ++c) {
+            float sa = g_ctx.raw_output_tensor[(4 + c) * 8400 + a];
+            if (sa > max_a) max_a = sa;
+            float sb = g_ctx.raw_output_tensor[a * 84 + (4 + c)];
+            if (sb > max_b) max_b = sb;
+        }
+    }
+    LOGE("out_mat: dims=%d, w=%d, h=%d, c=%d, cstep=%d, max_a=%f, max_b=%f",
+         out_mat.dims, out_mat.w, out_mat.h, out_mat.c, (int)out_mat.cstep, max_a, max_b);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     float inference_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
@@ -365,12 +521,22 @@ int yolo_engine_forward_rgba(
     out_result->active_backend = g_ctx.active_backend;
     out_result->status_code = rust_ret;
 
+    LOGE("yolo_forward: ret=%d, num_detections=%d, inf=%.1fms, track=%.1fms",
+         rust_ret, out_result->num_detections, inference_ms, tracker_ms);
+
     return 0;
 }
 
 void yolo_engine_destroy(void) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (g_ctx.initialized) {
         g_ctx.net.clear();
+#if NCNN_VULKAN
+        if (g_ctx.gpu_instance_created) {
+            ncnn::destroy_gpu_instance();
+            g_ctx.gpu_instance_created = false;
+        }
+#endif
         yolo_rust_destroy();
         g_ctx.initialized = false;
     }

@@ -23,7 +23,18 @@ pub fn decode_tensor(
         return 0;
     }
 
-    let inv_scale = 1.0 / scale;
+    let scaled_w = if pad_w > 0.0 || pad_h > 0.0 || scale <= 1.0 {
+        (640.0 - 2.0 * pad_w).max(1.0)
+    } else {
+        scale
+    };
+    let scaled_h = if pad_w > 0.0 || pad_h > 0.0 || scale <= 1.0 {
+        (640.0 - 2.0 * pad_h).max(1.0)
+    } else {
+        scale
+    };
+    let inv_scale_w = 1.0 / scaled_w;
+    let inv_scale_h = 1.0 / scaled_h;
     let mut count = 0;
 
     for anchor in 0..NUM_ANCHORS {
@@ -56,10 +67,10 @@ pub fn decode_tensor(
         let lb_y2 = cy + h * 0.5;
 
         // Unpad and scale to normalized [0, 1] frame coordinates
-        let x1 = ((lb_x1 - pad_w) * inv_scale).clamp(0.0, 1.0);
-        let y1 = ((lb_y1 - pad_h) * inv_scale).clamp(0.0, 1.0);
-        let x2 = ((lb_x2 - pad_w) * inv_scale).clamp(0.0, 1.0);
-        let y2 = ((lb_y2 - pad_h) * inv_scale).clamp(0.0, 1.0);
+        let x1 = ((lb_x1 - pad_w) * inv_scale_w).clamp(0.0, 1.0);
+        let y1 = ((lb_y1 - pad_h) * inv_scale_h).clamp(0.0, 1.0);
+        let x2 = ((lb_x2 - pad_w) * inv_scale_w).clamp(0.0, 1.0);
+        let y2 = ((lb_y2 - pad_h) * inv_scale_h).clamp(0.0, 1.0);
 
         if x2 <= x1 || y2 <= y1 {
             continue;

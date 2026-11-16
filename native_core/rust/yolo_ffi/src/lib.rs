@@ -103,6 +103,7 @@ pub extern "C" fn yolo_rust_process_frame(
 
     result.num_detections = active_count as i32;
     result.frame_id = frame_id;
+    result.status_code = (decoded_count as i32) * 1000 + (nms_count as i32);
 
     0
 }

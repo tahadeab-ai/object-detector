@@ -106,10 +106,16 @@ class _SampleBenchmarkViewState extends State<SampleBenchmarkView> {
             postLatencies.add(res.trackerTimeMs.toDouble());
 
             final detections = <DetectionItem>[];
+            final labelsRepo = CocoLabelsRepository();
             for (int k = 0; k < res.numDetections && k < yoloMaxBoxes; k++) {
               detections.add(DetectionItem.fromNative(res.boxes[k]));
             }
             _currentDetections = detections;
+            final names = detections
+                .map((d) => labelsRepo.getLabel(d.classId, isArabic: false))
+                .toList();
+            debugPrint(
+                '[SampleBenchmark] Asset: $assetPath | Count: ${detections.length} | Classes: $names | Inf: ${res.inferenceTimeMs.toStringAsFixed(1)}ms | Track: ${res.trackerTimeMs.toStringAsFixed(1)}ms');
           }
         } catch (_) {
           // Native library unavailable on non-Android host runner

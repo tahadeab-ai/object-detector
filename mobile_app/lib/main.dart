@@ -1,16 +1,20 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'core/services/diagnostics_service.dart';
 import 'features/cockpit/cockpit_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Initialize native NCNN engine and model assets on startup
+  await DiagnosticsService().initializeEngine();
+
   List<CameraDescription> cameras = [];
   try {
     cameras = await availableCameras();
   } catch (_) {
-    // Camera may be absent in desktop verification or host runner
+    // Camera may require runtime permission on device
   }
 
   runApp(YoloNcnnCockpitApp(cameras: cameras));

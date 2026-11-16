@@ -13,6 +13,8 @@ class TelemetryTopBar extends StatelessWidget {
   final VoidCallback onToggleBackend;
   final VoidCallback onOpenSampleMode;
   final VoidCallback onOpenSettings;
+  final VoidCallback? onOpenDiagnostics;
+  final VoidCallback? onSwitchCamera;
   final CocoLabelsRepository labelsRepo;
 
   TelemetryTopBar({
@@ -24,6 +26,8 @@ class TelemetryTopBar extends StatelessWidget {
     required this.onToggleBackend,
     required this.onOpenSampleMode,
     required this.onOpenSettings,
+    this.onOpenDiagnostics,
+    this.onSwitchCamera,
     CocoLabelsRepository? repo,
   }) : labelsRepo = repo ?? CocoLabelsRepository();
 
@@ -179,15 +183,18 @@ class TelemetryTopBar extends StatelessWidget {
 
               // 3. Secondary Navigation & Action Row
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text(
-                    isArabic
-                        ? 'المسارات: ${telemetry.confirmedTracks} مؤكد / ${telemetry.activeTracks} نشط'
-                        : 'Tracks: ${telemetry.confirmedTracks} confirmed / ${telemetry.activeTracks} active',
-                    style: const TextStyle(color: Colors.white70, fontSize: 11),
+                  Expanded(
+                    child: Text(
+                      isArabic
+                          ? 'المسارات: ${telemetry.confirmedTracks} مؤكد / ${telemetry.activeTracks} نشط'
+                          : 'Tracks: ${telemetry.confirmedTracks} conf / ${telemetry.activeTracks} act',
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                      overflow: TextOverflow.ellipsis,
+                    ),
                   ),
                   Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
                       // Language Toggle
                       IconButton(
@@ -201,29 +208,52 @@ class TelemetryTopBar extends StatelessWidget {
                         ),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 32, minHeight: 28),
+                            const BoxConstraints(minWidth: 26, minHeight: 28),
                         onPressed: onToggleLanguage,
                       ),
-                      const SizedBox(width: 8),
+                      const SizedBox(width: 4),
                       // Sample Benchmark Mode
                       IconButton(
                         icon: const Icon(Icons.photo_library_outlined,
                             size: 18, color: Colors.white),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                            const BoxConstraints(minWidth: 26, minHeight: 28),
                         onPressed: onOpenSampleMode,
                       ),
-                      const SizedBox(width: 8),
+                      const SizedBox(width: 4),
                       // Settings Sheet
                       IconButton(
                         icon: const Icon(Icons.tune_rounded,
                             size: 18, color: Colors.white),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                            const BoxConstraints(minWidth: 26, minHeight: 28),
                         onPressed: onOpenSettings,
                       ),
+                      if (onOpenDiagnostics != null) ...[
+                        const SizedBox(width: 4),
+                        // Diagnostics Screen
+                        IconButton(
+                          icon: const Icon(Icons.analytics_outlined,
+                              size: 18, color: Colors.cyanAccent),
+                          padding: EdgeInsets.zero,
+                          constraints:
+                              const BoxConstraints(minWidth: 26, minHeight: 28),
+                          onPressed: onOpenDiagnostics,
+                        ),
+                      ],
+                      if (onSwitchCamera != null) ...[
+                        const SizedBox(width: 4),
+                        IconButton(
+                          icon: const Icon(Icons.flip_camera_android_rounded,
+                              size: 18, color: Colors.white),
+                          padding: EdgeInsets.zero,
+                          constraints:
+                              const BoxConstraints(minWidth: 26, minHeight: 28),
+                          onPressed: onSwitchCamera,
+                        ),
+                      ],
                     ],
                   ),
                 ],
