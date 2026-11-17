@@ -153,15 +153,11 @@ class ModelManager extends ChangeNotifier {
     final paramFile = File('${modelsDir.path}/$paramName');
     final binFile = File('${modelsDir.path}/$binName');
 
-    if (!paramFile.existsSync() || paramFile.lengthSync() == 0) {
-      final data = await rootBundle.load(profile.paramAsset);
-      await paramFile.writeAsBytes(data.buffer.asUint8List(), flush: true);
-    }
+    final paramData = await rootBundle.load(profile.paramAsset);
+    await paramFile.writeAsBytes(paramData.buffer.asUint8List(), flush: true);
 
-    if (!binFile.existsSync() || binFile.lengthSync() == 0) {
-      final data = await rootBundle.load(profile.binAsset);
-      await binFile.writeAsBytes(data.buffer.asUint8List(), flush: true);
-    }
+    final binData = await rootBundle.load(profile.binAsset);
+    await binFile.writeAsBytes(binData.buffer.asUint8List(), flush: true);
 
     return {
       'param': paramFile.path,

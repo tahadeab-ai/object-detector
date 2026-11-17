@@ -200,10 +200,19 @@ class InferenceWorker {
       taskId: 0,
     );
 
-    _sendPort!.send(task);
-    final res = await comp.future;
-    if (res is IsolateFrameResult) return res;
-    return null;
+    try {
+      _sendPort!.send(task);
+      final res = await comp.future.timeout(const Duration(milliseconds: 1500));
+      if (res is IsolateFrameResult) return res;
+      return null;
+    } catch (e) {
+      return null;
+    } finally {
+      _isBusy = false;
+      if (_currentTaskCompleter == comp) {
+        _currentTaskCompleter = null;
+      }
+    }
   }
 
   /// Single-Slot Multi-Task Frame Processing
@@ -242,10 +251,19 @@ class InferenceWorker {
       taskId: task.id,
     );
 
-    _sendPort!.send(inferenceTask);
-    final res = await comp.future;
-    if (res is MultiTaskFrameResult) return res;
-    return null;
+    try {
+      _sendPort!.send(inferenceTask);
+      final res = await comp.future.timeout(const Duration(milliseconds: 1500));
+      if (res is MultiTaskFrameResult) return res;
+      return null;
+    } catch (e) {
+      return null;
+    } finally {
+      _isBusy = false;
+      if (_currentTaskCompleter == comp) {
+        _currentTaskCompleter = null;
+      }
+    }
   }
 
   void stop() {
@@ -261,6 +279,13 @@ class InferenceWorker {
     replyPort.send(port.sendPort);
 
     final engine = YoloNcnnEngine.getInstance();
+
+    Pointer<Uint8> yPersistentPtr = nullptr;
+    int yCap = 0;
+    Pointer<Uint8> uPersistentPtr = nullptr;
+    int uCap = 0;
+    Pointer<Uint8> vPersistentPtr = nullptr;
+    int vCap = 0;
 
     port.listen((message) {
       if (message is _SwitchModelMessage) {
@@ -283,14 +308,33 @@ class InferenceWorker {
         try {
           engine.setBackend(backend: message.backend);
 
-          final yPtr = calloc<Uint8>(message.yBytes.length);
-          yPtr.asTypedList(message.yBytes.length).setAll(0, message.yBytes);
+          final yLen = message.yBytes.length;
+          if (yPersistentPtr == nullptr || yCap < yLen) {
+            if (yPersistentPtr != nullptr) calloc.free(yPersistentPtr);
+            yCap = yLen + 4096;
+            yPersistentPtr = calloc<Uint8>(yCap);
+          }
+          yPersistentPtr.asTypedList(yLen).setAll(0, message.yBytes);
 
-          final uPtr = calloc<Uint8>(message.uBytes.length);
-          uPtr.asTypedList(message.uBytes.length).setAll(0, message.uBytes);
+          final uLen = message.uBytes.length;
+          if (uPersistentPtr == nullptr || uCap < uLen) {
+            if (uPersistentPtr != nullptr) calloc.free(uPersistentPtr);
+            uCap = uLen + 4096;
+            uPersistentPtr = calloc<Uint8>(uCap);
+          }
+          uPersistentPtr.asTypedList(uLen).setAll(0, message.uBytes);
 
-          final vPtr = calloc<Uint8>(message.vBytes.length);
-          vPtr.asTypedList(message.vBytes.length).setAll(0, message.vBytes);
+          final vLen = message.vBytes.length;
+          if (vPersistentPtr == nullptr || vCap < vLen) {
+            if (vPersistentPtr != nullptr) calloc.free(vPersistentPtr);
+            vCap = vLen + 4096;
+            vPersistentPtr = calloc<Uint8>(vCap);
+          }
+          vPersistentPtr.asTypedList(vLen).setAll(0, message.vBytes);
+
+          final yPtr = yPersistentPtr;
+          final uPtr = uPersistentPtr;
+          final vPtr = vPersistentPtr;
 
           final task = VisionTask.fromId(message.taskId);
 
@@ -308,10 +352,6 @@ class InferenceWorker {
               sensorOrientation: message.sensorOrientation,
               outResult: outResult,
             );
-
-            calloc.free(yPtr);
-            calloc.free(uPtr);
-            calloc.free(vPtr);
 
             if (ret == 0) {
               final res = outResult.ref;
@@ -382,10 +422,6 @@ class InferenceWorker {
               outBuffer: segBuffer.cast(),
             );
 
-            calloc.free(yPtr);
-            calloc.free(uPtr);
-            calloc.free(vPtr);
-
             final res = segBuffer.ref;
             final segItems = <SegmentationItem>[];
             for (int i = 0; i < res.numObjects && i < maxSegObjects; i++) {
@@ -431,10 +467,6 @@ class InferenceWorker {
               sensorOrientation: message.sensorOrientation,
               outBuffer: poseBuffer.cast(),
             );
-
-            calloc.free(yPtr);
-            calloc.free(uPtr);
-            calloc.free(vPtr);
 
             final res = poseBuffer.ref;
             final poseItems = <PoseItem>[];
@@ -484,10 +516,6 @@ class InferenceWorker {
               outBuffer: clsBuffer.cast(),
             );
 
-            calloc.free(yPtr);
-            calloc.free(uPtr);
-            calloc.free(vPtr);
-
             final res = clsBuffer.ref;
             final clsItems = <ClassificationItem>[];
             for (int i = 0; i < res.numItems && i < maxTopK; i++) {
@@ -521,10 +549,6 @@ class InferenceWorker {
               sensorOrientation: message.sensorOrientation,
               outBuffer: obbBuffer.cast(),
             );
-
-            calloc.free(yPtr);
-            calloc.free(uPtr);
-            calloc.free(vPtr);
 
             final res = obbBuffer.ref;
             final obbItems = <ObbItem>[];

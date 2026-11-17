@@ -1,8 +1,0 @@
-[package]
-name = "yolo_core"
-version = "1.0.0"
-edition = "2021"
-authors = ["YOLO NCNN Detector Team"]
-description = "Pure Rust YOLO11 Tensor Decoder, Class-Aware NMS, and Multi-Object Tracker"
-
-[dependencies]

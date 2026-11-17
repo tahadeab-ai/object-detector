@@ -1,37 +1,31 @@
 import 'package:flutter/material.dart';
 import '../../core/theme/design_tokens.dart';
 
-/// Minimal Tactical Bottom Dock (height 48px).
-/// Floating glassmorphic dock offering thumb-first one-handed access to essential actions:
-/// Language (AR/EN), Sample Benchmark, Torch, Freeze, Settings, Diagnostics, Camera Flip.
+/// Clean Tactical Bottom Dock (height 52px).
+/// 5 well-spaced buttons:
+/// 1. Language toggle (عربي / EN)
+/// 2. Sample Benchmark Mode (Icons.photo_library_outlined)
+/// 3. Freeze / Pause (Icons.pause_rounded / Icons.play_arrow_rounded)
+/// 4. Flip Camera (Icons.flip_camera_ios_outlined)
+/// 5. Settings & Diagnostics Sheet (Icons.tune_rounded)
 class CockpitBottomDock extends StatelessWidget {
   final bool isArabic;
-  final bool isTorchOn;
   final bool isFrozen;
   final VoidCallback onToggleLanguage;
   final VoidCallback onOpenSampleMode;
-  final VoidCallback onToggleTorch;
   final VoidCallback onToggleFreeze;
-  final VoidCallback onOpenSettings;
-  final VoidCallback onOpenDiagnostics;
   final VoidCallback onSwitchCamera;
-  final VoidCallback onOpenModelManager;
-  final VoidCallback onOpenPerformanceDashboard;
+  final VoidCallback onOpenSettings;
 
   const CockpitBottomDock({
     super.key,
     required this.isArabic,
-    required this.isTorchOn,
     required this.isFrozen,
     required this.onToggleLanguage,
     required this.onOpenSampleMode,
-    required this.onToggleTorch,
     required this.onToggleFreeze,
-    required this.onOpenSettings,
-    required this.onOpenDiagnostics,
     required this.onSwitchCamera,
-    required this.onOpenModelManager,
-    required this.onOpenPerformanceDashboard,
+    required this.onOpenSettings,
   });
 
   Widget _buildDockButton({
@@ -46,20 +40,20 @@ class CockpitBottomDock extends StatelessWidget {
       color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(24),
         child: Container(
           constraints: const BoxConstraints(
-            minWidth: AppTokens.minTouchTarget,
-            minHeight: AppTokens.minTouchTarget,
+            minWidth: 52,
+            minHeight: 48,
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           alignment: Alignment.center,
           child: label != null
               ? Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(
                     color: isActive ? activeColor.withValues(alpha: 0.2) : Colors.transparent,
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.circular(10),
                     border: Border.all(
                       color: isActive ? activeColor : AppTokens.hairline,
                       width: 1.0,
@@ -69,7 +63,7 @@ class CockpitBottomDock extends StatelessWidget {
                     label,
                     style: TextStyle(
                       fontFamily: AppTokens.fontCairo,
-                      fontSize: 12,
+                      fontSize: 13,
                       fontWeight: FontWeight.w700,
                       color: isActive ? activeColor : AppTokens.text,
                     ),
@@ -77,7 +71,7 @@ class CockpitBottomDock extends StatelessWidget {
                 )
               : Icon(
                   icon,
-                  size: 20,
+                  size: 22,
                   color: isActive ? activeColor : AppTokens.text,
                 ),
         ),
@@ -88,22 +82,23 @@ class CockpitBottomDock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 4),
+      height: 52,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         color: AppTokens.surfaceGlass,
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: BorderRadius.circular(26),
         border: Border.all(color: AppTokens.hairline, width: 1.0),
         boxShadow: const [
           BoxShadow(
             color: Colors.black45,
-            blurRadius: 10,
+            blurRadius: 12,
             offset: Offset(0, 4),
           ),
         ],
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
           // 1. Language Toggle (AR / EN)
           _buildDockButton(
@@ -111,6 +106,7 @@ class CockpitBottomDock extends StatelessWidget {
             label: isArabic ? 'EN' : 'عربي',
             onTap: onToggleLanguage,
           ),
+          const SizedBox(width: 4),
 
           // 2. Sample Mode Benchmark
           _buildDockButton(
@@ -118,54 +114,29 @@ class CockpitBottomDock extends StatelessWidget {
             onTap: onOpenSampleMode,
             color: AppTokens.catFood,
           ),
+          const SizedBox(width: 4),
 
-          // 3. Torch Toggle
+          // 3. Freeze Frame Toggle
           _buildDockButton(
-            icon: isTorchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
-            onTap: onToggleTorch,
-            isActive: isTorchOn,
-            color: AppTokens.warn,
-          ),
-
-          // 4. Freeze Frame Toggle
-          _buildDockButton(
-            icon: isFrozen ? Icons.pause_circle_filled_rounded : Icons.pause_circle_outline_rounded,
+            icon: isFrozen ? Icons.play_arrow_rounded : Icons.pause_rounded,
             onTap: onToggleFreeze,
             isActive: isFrozen,
-            color: AppTokens.accent,
+            color: isFrozen ? AppTokens.warn : AppTokens.accent,
           ),
+          const SizedBox(width: 4),
 
-          // 5. Camera Flip
+          // 4. Camera Flip
           _buildDockButton(
-            icon: Icons.flip_camera_android_rounded,
+            icon: Icons.flip_camera_ios_outlined,
             onTap: onSwitchCamera,
           ),
+          const SizedBox(width: 4),
 
-          // 6. Model & Task Manager
-          _buildDockButton(
-            icon: Icons.view_in_ar_rounded,
-            onTap: onOpenModelManager,
-            color: AppTokens.catVehicle,
-          ),
-
-          // 7. Performance Dashboard
-          _buildDockButton(
-            icon: Icons.speed_rounded,
-            onTap: onOpenPerformanceDashboard,
-            color: AppTokens.catIndoor,
-          ),
-
-          // 8. Settings Bottom Sheet
+          // 5. Settings Bottom Sheet
           _buildDockButton(
             icon: Icons.tune_rounded,
             onTap: onOpenSettings,
-          ),
-
-          // 9. Diagnostics JSON Export
-          _buildDockButton(
-            icon: Icons.analytics_outlined,
-            onTap: onOpenDiagnostics,
-            color: AppTokens.ok,
+            color: AppTokens.accent,
           ),
         ],
       ),

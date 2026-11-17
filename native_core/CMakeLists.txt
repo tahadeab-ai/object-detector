@@ -5,11 +5,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn-android-vulkan/${ANDROID_ABI}")
-set(YOLO_RUST_LIB "${CMAKE_CURRENT_SOURCE_DIR}/rust/target/aarch64-linux-android/release/libyolo_rust.a")
-
-if(NOT EXISTS "${YOLO_RUST_LIB}")
-    message(FATAL_ERROR "Rust static library not found at ${YOLO_RUST_LIB}. Run cargo build first.")
-endif()
 
 set(ncnn_DIR "${NCNN_DIR}/lib/cmake/ncnn")
 find_package(ncnn REQUIRED)
@@ -35,7 +30,6 @@ add_library(yolo_ncnn SHARED
 target_link_libraries(yolo_ncnn
     PRIVATE
     ncnn
-    -Wl,--whole-archive "${YOLO_RUST_LIB}" -Wl,--no-whole-archive
     ${VULKAN_LIB}
     ${LOG_LIB}
     ${ANDROID_LIB}

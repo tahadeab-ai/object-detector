@@ -246,7 +246,7 @@ class MultiTaskHudPainter extends CustomPainter {
     for (final pose in poses) {
       if (pose.confidence < 0.40) continue;
 
-      final classColor = AppTokens.accent;
+      const classColor = AppTokens.accent;
 
       // Draw subtle bounding box
       final left = (pose.x1 * size.width).clamp(0.0, size.width);
@@ -325,7 +325,7 @@ class MultiTaskHudPainter extends CustomPainter {
     final cardHeight = (classifications.length * 28.0) + 36.0;
 
     final cardX = isArabic ? 16.0 : (size.width - cardWidth - 16.0);
-    final cardY = 72.0;
+    const cardY = 72.0;
 
     final cardRect = RRect.fromRectAndRadius(
       Rect.fromLTWH(cardX, cardY, cardWidth, cardHeight),

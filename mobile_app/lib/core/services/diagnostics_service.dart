@@ -153,22 +153,16 @@ class DiagnosticsService {
       final outName = output?['name']?.toString() ?? 'out0';
       debugPrint('[DiagnosticsService] metadata parsed: in=$inName, out=$outName');
 
-      // 2. Extract model files to Application Support Directory
+      // 2. Extract model files to Application Support Directory (Unconditionally overwrite fresh assets)
       final supportDir = await getApplicationSupportDirectory();
       final paramFile = File('${supportDir.path}/model.ncnn.param');
       final binFile = File('${supportDir.path}/model.ncnn.bin');
 
-      if (!await paramFile.exists()) {
-        final paramBytes =
-            await rootBundle.load('assets/models/model.ncnn.param');
-        await paramFile.writeAsBytes(paramBytes.buffer.asUint8List(),
-            flush: true);
-      }
+      final paramAsset = await rootBundle.load('assets/models/yolo11n.ncnn.param');
+      await paramFile.writeAsBytes(paramAsset.buffer.asUint8List(), flush: true);
 
-      if (!await binFile.exists()) {
-        final binBytes = await rootBundle.load('assets/models/model.ncnn.bin');
-        await binFile.writeAsBytes(binBytes.buffer.asUint8List(), flush: true);
-      }
+      final binAsset = await rootBundle.load('assets/models/yolo11n.ncnn.bin');
+      await binFile.writeAsBytes(binAsset.buffer.asUint8List(), flush: true);
 
       // Compute SHA256
       final paramBytes = await paramFile.readAsBytes();

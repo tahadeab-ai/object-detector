@@ -1,32 +1,33 @@
 #include "yolo_ncnn_c_api.h"
 
+#include <android/log.h>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <cfloat>
-#include <algorithm>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <mutex>
-#include <android/log.h>
+
+#include <net.h>
+#include <mat.h>
+#include <cpu.h>
+
+#if NCNN_VULKAN
+#include <gpu.h>
+#endif
 
 #define LOG_TAG "YoloNcnnNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#endif
-
-// Tencent NCNN headers
-#include "net.h"
-#include "mat.h"
-#include "cpu.h"
-#include "layer.h"
-#if NCNN_VULKAN
-#include "gpu.h"
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 // Compatibility bridge for NDK 28 libc++ where __hash_memory was inlined
@@ -38,43 +39,21 @@ inline namespace __ndk1 {
 }
 }
 
-// Rust C-ABI forward declaration linked via libyolo_rust.a
-extern "C" {
-    int yolo_rust_init(void);
-    void yolo_rust_destroy(void);
-    int yolo_rust_process_frame(
-        const float* raw_tensor,
-        float scale,
-        float pad_w,
-        float pad_h,
-        uint32_t frame_id,
-        YoloFrameResult* out_result
-    );
-}
-
 namespace {
 
-constexpr float PI_CONST = 3.14159265358979323846f;
-
 struct CandidateObject {
-    float x0, y0, x1, y1;
-    float cx, cy, w, h;
-    float angle_rad, angle_deg;
-    float corners[8];
+    float x0, y0, x1, y1; // normalized [0.0, 1.0]
     int label;
     float prob;
-    int gindex; // grid index for mask coefficient association
-    std::vector<float> keypoints; // 17 * 3 for pose
+    int anchor_idx;
 };
 
 struct EngineContext {
     ncnn::Net net;
     int active_task = YOLO_TASK_DETECTION;
-    int target_size = 640;
+    int target_size = 320; // default 320 matching nihui for 35+ FPS on Galaxy Note 10
     std::string in_blob_name = "in0";
     std::string out_blob_name = "out0";
-    std::string out1_blob_name = "out1";
-    std::string out2_blob_name = "out2";
     std::string param_path;
     std::string bin_path;
     int active_backend = 0; // 0=CPU, 1=Vulkan, 2=Turnip
@@ -83,11 +62,8 @@ struct EngineContext {
     int current_gpu_driver = -1; // -1=none, 1=standard vulkan, 2=turnip
     uint32_t frame_counter = 0;
 
-    // Fixed static scratch buffers (Zero heap allocation per frame)
-    // 640 x 640 x 3 = 1,228,800 bytes
-    uint8_t rgb_letterbox_buf[640 * 640 * 3];
-    // 84 * 8400 = 705,600 floats = 2,822,400 bytes (for detection)
-    float raw_output_tensor[84 * 8400];
+    // Fixed static scratch buffer up to 1024 x 1024 x 3 = 3,145,728 bytes (Zero heap alloc per frame)
+    uint8_t rgb_letterbox_buf[1024 * 1024 * 3];
 };
 
 static EngineContext g_ctx;
@@ -140,21 +116,20 @@ static void sort_candidates_descent(std::vector<CandidateObject>& objects) {
     qsort_candidates_descent(objects, 0, (int)objects.size() - 1);
 }
 
-static inline float calc_box_iou(const CandidateObject& a, const CandidateObject& b) {
-    float inter_x0 = std::max(a.x0, b.x0);
-    float inter_y0 = std::max(a.y0, b.y0);
-    float inter_x1 = std::min(a.x1, b.x1);
-    float inter_y1 = std::min(a.y1, b.y1);
-
-    float inter_w = std::max(0.0f, inter_x1 - inter_x0);
-    float inter_h = std::max(0.0f, inter_y1 - inter_y0);
-    float inter_area = inter_w * inter_h;
-
-    float area_a = (a.x1 - a.x0) * (a.y1 - a.y0);
-    float area_b = (b.x1 - b.x0) * (b.y1 - b.y0);
-    float union_area = area_a + area_b - inter_area;
+static inline float calc_norm_iou(float ax1, float ay1, float ax2, float ay2,
+                                  float bx1, float by1, float bx2, float by2) {
+    float ix1 = std::max(ax1, bx1);
+    float iy1 = std::max(ay1, by1);
+    float ix2 = std::min(ax2, bx2);
+    float iy2 = std::min(ay2, by2);
+    float iw = std::max(0.0f, ix2 - ix1);
+    float ih = std::max(0.0f, iy2 - iy1);
+    float inter = iw * ih;
+    float area_a = (ax2 - ax1) * (ay2 - ay1);
+    float area_b = (bx2 - bx1) * (by2 - by1);
+    float union_area = area_a + area_b - inter;
     if (union_area <= 0.0f) return 0.0f;
-    return inter_area / union_area;
+    return inter / union_area;
 }
 
 static void nms_filter_candidates(const std::vector<CandidateObject>& src, std::vector<int>& picked, float nms_threshold, bool agnostic = false) {
@@ -166,7 +141,7 @@ static void nms_filter_candidates(const std::vector<CandidateObject>& src, std::
         for (int j = 0; j < (int)picked.size(); j++) {
             const CandidateObject& b = src[picked[j]];
             if (!agnostic && a.label != b.label) continue;
-            if (calc_box_iou(a, b) > nms_threshold) {
+            if (calc_norm_iou(a.x0, a.y0, a.x1, a.y1, b.x0, b.y0, b.x1, b.y1) > nms_threshold) {
                 keep = 0;
                 break;
             }
@@ -175,136 +150,8 @@ static void nms_filter_candidates(const std::vector<CandidateObject>& src, std::
     }
 }
 
-// Compute oriented bounding box 4 corners from center, size, and angle
-static void compute_obb_corners(float cx, float cy, float w, float h, float angle_rad, float* corners) {
-    float cos_a = cosf(angle_rad);
-    float sin_a = sinf(angle_rad);
-    float half_w = w * 0.5f;
-    float half_h = h * 0.5f;
-
-    float dx[4] = {-half_w,  half_w, half_w, -half_w};
-    float dy[4] = {-half_h, -half_h, half_h,  half_h};
-
-    for (int i = 0; i < 4; i++) {
-        corners[i * 2 + 0] = cx + dx[i] * cos_a - dy[i] * sin_a;
-        corners[i * 2 + 1] = cy + dx[i] * sin_a + dy[i] * cos_a;
-    }
-}
-
-// Fast Rotated NMS using approximate oriented intersection
-static void nms_filter_obb(const std::vector<CandidateObject>& src, std::vector<int>& picked, float nms_threshold) {
-    picked.clear();
-    const int n = (int)src.size();
-    for (int i = 0; i < n; i++) {
-        const CandidateObject& a = src[i];
-        int keep = 1;
-        for (int j = 0; j < (int)picked.size(); j++) {
-            const CandidateObject& b = src[picked[j]];
-            if (a.label != b.label) continue;
-
-            // Distance check between centers
-            float dcx = a.cx - b.cx;
-            float dcy = a.cy - b.cy;
-            float dist_sq = dcx * dcx + dcy * dcy;
-            float radius_sum = 0.5f * (std::max(a.w, a.h) + std::max(b.w, b.h));
-            if (dist_sq > radius_sum * radius_sum) continue;
-
-            // Approximate oriented overlap via axis-aligned bounding box of corners
-            float min_ax = std::min({a.corners[0], a.corners[2], a.corners[4], a.corners[6]});
-            float max_ax = std::max({a.corners[0], a.corners[2], a.corners[4], a.corners[6]});
-            float min_ay = std::min({a.corners[1], a.corners[3], a.corners[5], a.corners[7]});
-            float max_ay = std::max({a.corners[1], a.corners[3], a.corners[5], a.corners[7]});
-
-            float min_bx = std::min({b.corners[0], b.corners[2], b.corners[4], b.corners[6]});
-            float max_bx = std::max({b.corners[0], b.corners[2], b.corners[4], b.corners[6]});
-            float min_by = std::min({b.corners[1], b.corners[3], b.corners[5], b.corners[7]});
-            float max_by = std::max({b.corners[1], b.corners[3], b.corners[5], b.corners[7]});
-
-            float inter_x0 = std::max(min_ax, min_bx);
-            float inter_y0 = std::max(min_ay, min_by);
-            float inter_x1 = std::min(max_ax, max_bx);
-            float inter_y1 = std::min(max_ay, max_by);
-            float inter_w = std::max(0.0f, inter_x1 - inter_x0);
-            float inter_h = std::max(0.0f, inter_y1 - inter_y0);
-            float inter_area = inter_w * inter_h;
-
-            float area_a = a.w * a.h;
-            float area_b = b.w * b.h;
-            float union_area = area_a + area_b - inter_area;
-            if (union_area > 0.0f && (inter_area / union_area) > nms_threshold) {
-                keep = 0;
-                break;
-            }
-        }
-        if (keep) picked.push_back(i);
-    }
-}
-
-// Helper: Setup backend for NCNN (CPU, Standard Vulkan, or Mesa Turnip)
-int setup_backend_internal(int backend) {
-#if NCNN_VULKAN
-    if (backend == 0) {
-        // CPU Backend
-        ncnn::set_cpu_powersave(2);
-        g_ctx.net.opt.use_vulkan_compute = false;
-        g_ctx.active_backend = 0;
-        LOGI("setup_backend_internal: CPU backend configured (4 threads, powersave=2)");
-        return 0;
-    }
-
-    // GPU requested: check if driver needs teardown & recreation
-    if (g_ctx.current_gpu_driver != backend) {
-        if (g_ctx.gpu_instance_created) {
-            ncnn::destroy_gpu_instance();
-            g_ctx.gpu_instance_created = false;
-        }
-
-        int create_ret = -1;
-        if (backend == 2) {
-            // Turnip Driver (libvulkan_freedreno.so)
-            LOGI("setup_backend_internal: Attempting Turnip Vulkan driver initialization...");
-            create_ret = ncnn::create_gpu_instance("libvulkan_freedreno.so");
-            if (create_ret != 0) {
-                LOGE("setup_backend_internal: Turnip driver init failed (%d), falling back to standard Vulkan", create_ret);
-                backend = 1;
-            }
-        }
-
-        if (backend == 1) {
-            // Standard Vendor Vulkan Driver
-            LOGI("setup_backend_internal: Initializing standard vendor Vulkan instance...");
-            create_ret = ncnn::create_gpu_instance();
-        }
-
-        if (create_ret == 0 && ncnn::get_gpu_count() > 0) {
-            g_ctx.gpu_instance_created = true;
-            g_ctx.current_gpu_driver = backend;
-            g_ctx.net.opt.use_vulkan_compute = true;
-            g_ctx.net.set_vulkan_device(0);
-            g_ctx.active_backend = backend;
-            LOGI("setup_backend_internal: Vulkan active on device 0 (Driver mode=%d, GPU count=%d)", backend, ncnn::get_gpu_count());
-            return backend;
-        } else {
-            LOGE("setup_backend_internal: Vulkan init failed or 0 GPUs found. Falling back to CPU.");
-            ncnn::set_cpu_powersave(2);
-            g_ctx.net.opt.use_vulkan_compute = false;
-            g_ctx.active_backend = 0;
-            return 0;
-        }
-    }
-    return g_ctx.active_backend;
-#else
-    (void)backend;
-    ncnn::set_cpu_powersave(2);
-    g_ctx.net.opt.use_vulkan_compute = false;
-    g_ctx.active_backend = 0;
-    LOGI("setup_backend_internal: NCNN_VULKAN not compiled in; using CPU");
-    return 0;
-#endif
-}
-
-// Convert YUV420 to RGB Letterbox buffer with rotation
-int prepare_letterbox_yuv(
+// Convert YUV420 to RGB Letterbox buffer with dynamic stride-32 padding and rotation
+int prepare_letterbox_yuv_stride32(
     const uint8_t* y_plane,
     const uint8_t* u_plane,
     const uint8_t* v_plane,
@@ -314,11 +161,12 @@ int prepare_letterbox_yuv(
     int uv_row_stride,
     int uv_pixel_stride,
     int sensor_orientation,
-    int target_w,
-    int target_h,
+    int target_size,
     float& scale,
     int& pad_w,
     int& pad_h,
+    int& in_w,
+    int& in_h,
     int& rot_w,
     int& rot_h
 ) {
@@ -329,20 +177,24 @@ int prepare_letterbox_yuv(
         rot_h = width;
     }
 
-    scale = std::min((float)target_w / (float)rot_w, (float)target_h / (float)rot_h);
+    scale = std::min((float)target_size / (float)rot_w, (float)target_size / (float)rot_h);
     int scaled_w = (int)(rot_w * scale);
     int scaled_h = (int)(rot_h * scale);
-    pad_w = (target_w - scaled_w) / 2;
-    pad_h = (target_h - scaled_h) / 2;
 
-    // Fill canvas with 114 gray
-    memset(g_ctx.rgb_letterbox_buf, 114, target_w * target_h * 3);
+    int wpad = (scaled_w + 31) / 32 * 32 - scaled_w;
+    int hpad = (scaled_h + 31) / 32 * 32 - scaled_h;
+    in_w = scaled_w + wpad;
+    in_h = scaled_h + hpad;
+    pad_w = wpad / 2;
+    pad_h = hpad / 2;
+
+    memset(g_ctx.rgb_letterbox_buf, 114, in_w * in_h * 3);
 
     for (int dy = 0; dy < scaled_h; ++dy) {
         int ry = (int)(dy / scale);
         if (ry >= rot_h) ry = rot_h - 1;
 
-        uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * target_w + pad_w) * 3;
+        uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * in_w + pad_w) * 3;
 
         for (int dx = 0; dx < scaled_w; ++dx) {
             int rx = (int)(dx / scale);
@@ -380,17 +232,18 @@ int prepare_letterbox_yuv(
     return 0;
 }
 
-// Convert RGBA to RGB Letterbox buffer with rotation
-int prepare_letterbox_rgba(
+// Convert RGBA to RGB Letterbox buffer with dynamic stride-32 padding and rotation
+int prepare_letterbox_rgba_stride32(
     const uint8_t* rgba,
     int width,
     int height,
     int sensor_orientation,
-    int target_w,
-    int target_h,
+    int target_size,
     float& scale,
     int& pad_w,
     int& pad_h,
+    int& in_w,
+    int& in_h,
     int& rot_w,
     int& rot_h
 ) {
@@ -401,19 +254,24 @@ int prepare_letterbox_rgba(
         rot_h = width;
     }
 
-    scale = std::min((float)target_w / (float)rot_w, (float)target_h / (float)rot_h);
+    scale = std::min((float)target_size / (float)rot_w, (float)target_size / (float)rot_h);
     int scaled_w = (int)(rot_w * scale);
     int scaled_h = (int)(rot_h * scale);
-    pad_w = (target_w - scaled_w) / 2;
-    pad_h = (target_h - scaled_h) / 2;
 
-    memset(g_ctx.rgb_letterbox_buf, 114, target_w * target_h * 3);
+    int wpad = (scaled_w + 31) / 32 * 32 - scaled_w;
+    int hpad = (scaled_h + 31) / 32 * 32 - scaled_h;
+    in_w = scaled_w + wpad;
+    in_h = scaled_h + hpad;
+    pad_w = wpad / 2;
+    pad_h = hpad / 2;
+
+    memset(g_ctx.rgb_letterbox_buf, 114, in_w * in_h * 3);
 
     for (int dy = 0; dy < scaled_h; ++dy) {
         int ry = (int)(dy / scale);
         if (ry >= rot_h) ry = rot_h - 1;
 
-        uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * target_w + pad_w) * 3;
+        uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * in_w + pad_w) * 3;
 
         for (int dx = 0; dx < scaled_w; ++dx) {
             int rx = (int)(dx / scale);
@@ -446,81 +304,148 @@ int prepare_letterbox_rgba(
     return 0;
 }
 
-// Generate proposals for YOLO11 multi-task models
-void decode_yolo11_grid_proposals(
-    const ncnn::Mat& pred,
-    int stride,
+// 144-Channel Pre-DFL Decoder matching nihui's prob_threshold = 0.25f
+void decode_yolo11_detection(
+    const ncnn::Mat& out0,
     int in_w,
     int in_h,
-    int reg_max,
-    int num_classes,
-    float prob_threshold,
-    int grid_offset,
-    std::vector<CandidateObject>& objects
+    int pad_w,
+    int pad_h,
+    float scale,
+    int rot_w,
+    int rot_h,
+    float conf_threshold,
+    std::vector<CandidateObject>& detections
 ) {
-    const int num_grid_x = in_w / stride;
-    const int num_grid_y = in_h / stride;
+    detections.clear();
+    const std::vector<int> strides = {8, 16, 32};
+    int row_offset = 0;
+    std::vector<CandidateObject> proposals;
 
-    for (int y = 0; y < num_grid_y; y++) {
-        for (int x = 0; x < num_grid_x; x++) {
-            int grid_idx = y * num_grid_x + x;
-            const float* pred_row = pred.row(grid_idx);
+    for (int s : strides) {
+        int num_grid_x = in_w / s;
+        int num_grid_y = in_h / s;
+        int num_anchors = num_grid_x * num_grid_y;
 
-            // Find best class score
-            int best_label = -1;
-            float max_score = -FLT_MAX;
-            for (int k = 0; k < num_classes; k++) {
-                float s = pred_row[reg_max * 4 + k];
-                if (s > max_score) {
-                    max_score = s;
-                    best_label = k;
+        for (int y = 0; y < num_grid_y; ++y) {
+            for (int x = 0; x < num_grid_x; ++x) {
+                int anchor_idx = row_offset + y * num_grid_x + x;
+                if (anchor_idx >= out0.h) continue;
+                const float* feat = out0.row(anchor_idx);
+
+                // Class logits are channels 64..143 (80 classes)
+                const float* class_logits = feat + 64;
+                int best_class = 0;
+                float max_logit = class_logits[0];
+                for (int c = 1; c < 80; ++c) {
+                    if (class_logits[c] > max_logit) {
+                        max_logit = class_logits[c];
+                        best_class = c;
+                    }
                 }
+
+                // Pre-DFL early score exit: matches nihui's 0.25 threshold
+                float score = fast_sigmoid(max_logit);
+                if (score < conf_threshold) continue;
+
+                // 16-bin Softmax DFL for 4 edges (left, top, right, bottom)
+                float ltrb[4];
+                for (int k = 0; k < 4; ++k) {
+                    const float* dfl_ptr = feat + k * 16;
+                    float max_v = dfl_ptr[0];
+                    for (int b = 1; b < 16; ++b) {
+                        if (dfl_ptr[b] > max_v) max_v = dfl_ptr[b];
+                    }
+                    float sum_exp = 0.0f;
+                    float exp_b[16];
+                    for (int b = 0; b < 16; ++b) {
+                        exp_b[b] = expf(dfl_ptr[b] - max_v);
+                        sum_exp += exp_b[b];
+                    }
+                    float dist = 0.0f;
+                    float inv_sum = 1.0f / sum_exp;
+                    for (int b = 0; b < 16; ++b) {
+                        dist += b * (exp_b[b] * inv_sum);
+                    }
+                    ltrb[k] = dist * s;
+                }
+
+                float pb_cx = (x + 0.5f) * s;
+                float pb_cy = (y + 0.5f) * s;
+                float raw_x0 = pb_cx - ltrb[0];
+                float raw_y0 = pb_cy - ltrb[1];
+                float raw_x1 = pb_cx + ltrb[2];
+                float raw_y1 = pb_cy + ltrb[3];
+
+                // Unpad and normalize to [0.0, 1.0] relative to upright frame (rot_w, rot_h)
+                float norm_x0 = (raw_x0 - pad_w) / (scale * rot_w);
+                float norm_y0 = (raw_y0 - pad_h) / (scale * rot_h);
+                float norm_x1 = (raw_x1 - pad_w) / (scale * rot_w);
+                float norm_y1 = (raw_y1 - pad_h) / (scale * rot_h);
+
+                norm_x0 = std::max(0.0f, std::min(1.0f, norm_x0));
+                norm_y0 = std::max(0.0f, std::min(1.0f, norm_y0));
+                norm_x1 = std::max(0.0f, std::min(1.0f, norm_x1));
+                norm_y1 = std::max(0.0f, std::min(1.0f, norm_y1));
+
+                CandidateObject obj;
+                obj.x0 = norm_x0;
+                obj.y0 = norm_y0;
+                obj.x1 = norm_x1;
+                obj.y1 = norm_y1;
+                obj.label = best_class;
+                obj.prob = score;
+                obj.anchor_idx = anchor_idx;
+                proposals.push_back(obj);
             }
-            float score = fast_sigmoid(max_score);
-            if (score < prob_threshold) continue;
+        }
+        row_offset += num_anchors;
+    }
 
-            // DFL Softmax decoding for 4 edges (ltrb)
-            float pred_ltrb[4];
-            for (int k = 0; k < 4; k++) {
-                const float* dfl_vals = pred_row + k * reg_max;
-                // Compute softmax over 16 bins
-                float max_v = -FLT_MAX;
-                for (int l = 0; l < reg_max; l++) {
-                    if (dfl_vals[l] > max_v) max_v = dfl_vals[l];
-                }
-                float sum_exp = 0.0f;
-                float exp_vals[16];
-                for (int l = 0; l < reg_max; l++) {
-                    exp_vals[l] = expf(dfl_vals[l] - max_v);
-                    sum_exp += exp_vals[l];
-                }
-                float dis = 0.0f;
-                float inv_sum = 1.0f / sum_exp;
-                for (int l = 0; l < reg_max; l++) {
-                    dis += l * (exp_vals[l] * inv_sum);
-                }
-                pred_ltrb[k] = dis * stride;
+    // Class-aware NMS matching nihui nms_threshold = 0.45f
+    sort_candidates_descent(proposals);
+    std::vector<int> picked;
+    nms_filter_candidates(proposals, picked, 0.45f, false);
+
+    for (int idx : picked) {
+        detections.push_back(proposals[idx]);
+    }
+}
+
+static int setup_backend_internal(int backend) {
+#if NCNN_VULKAN
+    if (backend == 1 || backend == 2) {
+        if (!g_ctx.gpu_instance_created) {
+            ncnn::create_gpu_instance();
+            g_ctx.gpu_instance_created = true;
+            g_ctx.current_gpu_driver = -1;
+        }
+
+        if (g_ctx.current_gpu_driver != backend) {
+            int gpu_count = ncnn::get_gpu_count();
+            if (gpu_count > 0) {
+                g_ctx.net.opt.use_vulkan_compute = true;
+                g_ctx.net.set_vulkan_device(0);
+                g_ctx.active_backend = backend;
+                g_ctx.current_gpu_driver = backend;
+                LOGI("setup_backend_internal: GPU activated (backend=%d, dev=0, count=%d)", backend, gpu_count);
+                return backend;
+            } else {
+                LOGW("setup_backend_internal: No Vulkan GPU devices found; falling back to CPU");
+                backend = 0;
             }
-
-            float pb_cx = (x + 0.5f) * stride;
-            float pb_cy = (y + 0.5f) * stride;
-
-            CandidateObject obj;
-            obj.x0 = pb_cx - pred_ltrb[0];
-            obj.y0 = pb_cy - pred_ltrb[1];
-            obj.x1 = pb_cx + pred_ltrb[2];
-            obj.y1 = pb_cy + pred_ltrb[3];
-            obj.cx = pb_cx;
-            obj.cy = pb_cy;
-            obj.w = obj.x1 - obj.x0;
-            obj.h = obj.y1 - obj.y0;
-            obj.label = best_label;
-            obj.prob = score;
-            obj.gindex = grid_offset + grid_idx;
-
-            objects.push_back(obj);
         }
     }
+
+    // CPU fallback
+    g_ctx.net.opt.use_vulkan_compute = false;
+    g_ctx.active_backend = 0;
+    return 0;
+#else
+    g_ctx.active_backend = 0;
+    LOGI("setup_backend_internal: NCNN_VULKAN not compiled in; using CPU");
+    return 0;
+#endif
 }
 
 } // namespace
@@ -528,11 +453,11 @@ void decode_yolo11_grid_proposals(
 extern "C" {
 
 // =============================================================================
-// Legacy Engine API Implementation (Preserving Existing Functionality)
+// Primary Detection Engine API (100% C++ Unified Pipeline)
 // =============================================================================
 
 int yolo_engine_init(const char* param_path, const char* bin_path, int use_vulkan) {
-    return yolo_multitask_init(YOLO_TASK_DETECTION, param_path, bin_path, 640, use_vulkan);
+    return yolo_multitask_init(YOLO_TASK_DETECTION, param_path, bin_path, 320, use_vulkan);
 }
 
 int yolo_engine_set_backend(int use_vulkan) {
@@ -575,7 +500,7 @@ void yolo_engine_destroy(void) {
 }
 
 // =============================================================================
-// Modern Multi-Task Engine API Implementation
+// Multi-Task & Dynamic Stride-32 API Implementation
 // =============================================================================
 
 int yolo_multitask_init(
@@ -583,105 +508,89 @@ int yolo_multitask_init(
     const char* param_path,
     const char* bin_path,
     int target_size,
-    int use_backend
+    int backend
 ) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
     if (!param_path || !bin_path) {
         LOGE("yolo_multitask_init: null paths passed");
         return -1;
     }
 
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-
     g_ctx.active_task = task_id;
+    g_ctx.target_size = target_size > 0 ? target_size : 320;
     g_ctx.param_path = param_path;
     g_ctx.bin_path = bin_path;
 
-    if (task_id == YOLO_TASK_CLASSIFICATION) {
-        g_ctx.target_size = 224; // Standard ImageNet size
-    } else if (target_size > 0) {
-        g_ctx.target_size = target_size;
-    } else {
-        g_ctx.target_size = 640;
-    }
-
     g_ctx.net.clear();
-    g_ctx.net.opt = ncnn::Option();
-    g_ctx.net.opt.lightmode = true;
-    g_ctx.net.opt.num_threads = 4;
-    g_ctx.net.opt.use_packing_layout = true;
+
+    // Fast FP16 mobile optimization
     g_ctx.net.opt.use_fp16_packed = true;
     g_ctx.net.opt.use_fp16_storage = true;
     g_ctx.net.opt.use_fp16_arithmetic = true;
+    g_ctx.net.opt.use_packing_layout = true;
+    g_ctx.net.opt.num_threads = 4;
 
-    setup_backend_internal(use_backend);
+    setup_backend_internal(backend);
 
     int ret_param = g_ctx.net.load_param(param_path);
-    int ret_bin = (ret_param == 0) ? g_ctx.net.load_model(bin_path) : -1;
+    int ret_bin = g_ctx.net.load_model(bin_path);
 
-#if NCNN_VULKAN
-    if ((ret_param != 0 || ret_bin != 0) && g_ctx.active_backend != 0) {
+    if ((ret_param != 0 || ret_bin != 0) && g_ctx.active_backend > 0) {
         LOGE("yolo_multitask_init: GPU load failed (param=%d, bin=%d), falling back to CPU", ret_param, ret_bin);
         g_ctx.net.clear();
-        g_ctx.net.opt.use_vulkan_compute = false;
-        g_ctx.active_backend = 0;
-        ncnn::set_cpu_powersave(2);
+        setup_backend_internal(0);
+        g_ctx.net.opt.num_threads = 4;
+        g_ctx.net.opt.use_fp16_packed = true;
+        g_ctx.net.opt.use_fp16_storage = true;
+        g_ctx.net.opt.use_fp16_arithmetic = true;
         ret_param = g_ctx.net.load_param(param_path);
         ret_bin = g_ctx.net.load_model(bin_path);
     }
-#endif
 
     if (ret_param != 0) {
-        LOGE("yolo_multitask_init: load_param failed (%d)", ret_param);
+        LOGE("yolo_multitask_init: load_param failed (%d) for task %d", ret_param, task_id);
         return -2;
     }
     if (ret_bin != 0) {
-        LOGE("yolo_multitask_init: load_model failed (%d)", ret_bin);
+        LOGE("yolo_multitask_init: load_model failed (%d) for task %d", ret_bin, task_id);
         return -3;
     }
 
-    if (task_id == YOLO_TASK_DETECTION) {
-        yolo_rust_init();
-    }
-
     g_ctx.initialized = true;
-    g_ctx.frame_counter = 0;
-    LOGI("yolo_multitask_init: SUCCESS, task=%d, size=%d, backend=%d",
-         g_ctx.active_task, g_ctx.target_size, g_ctx.active_backend);
+    LOGI("yolo_multitask_init: SUCCESS, task=%d, size=%d, backend=%d", g_ctx.active_task, g_ctx.target_size, g_ctx.active_backend);
     return 0;
 }
 
 int yolo_multitask_set_target_size(int target_size) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (target_size <= 0) return -1;
-    if (g_ctx.active_task == YOLO_TASK_CLASSIFICATION) {
-        g_ctx.target_size = 224;
-    } else {
-        g_ctx.target_size = target_size;
-    }
+    g_ctx.target_size = target_size;
     LOGI("yolo_multitask_set_target_size: target_size set to %d", g_ctx.target_size);
-    return g_ctx.target_size;
+    return 0;
 }
 
 int yolo_multitask_set_backend(int backend) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (!g_ctx.initialized) return -1;
-    if (g_ctx.active_backend == backend) return g_ctx.active_backend;
+    if (!g_ctx.initialized) {
+        g_ctx.active_backend = backend;
+        return 0;
+    }
 
     g_ctx.net.clear();
-    g_ctx.net.opt = ncnn::Option();
-    g_ctx.net.opt.lightmode = true;
+    setup_backend_internal(backend);
+
     g_ctx.net.opt.num_threads = 4;
-    g_ctx.net.opt.use_packing_layout = true;
     g_ctx.net.opt.use_fp16_packed = true;
     g_ctx.net.opt.use_fp16_storage = true;
     g_ctx.net.opt.use_fp16_arithmetic = true;
 
-    setup_backend_internal(backend);
+    int ret_param = g_ctx.net.load_param(g_ctx.param_path.c_str());
+    int ret_bin = g_ctx.net.load_model(g_ctx.bin_path.c_str());
 
-    int rp = g_ctx.net.load_param(g_ctx.param_path.c_str());
-    int rb = g_ctx.net.load_model(g_ctx.bin_path.c_str());
-    if (rp != 0 || rb != 0) {
+    if (ret_param != 0 || ret_bin != 0) {
         LOGE("yolo_multitask_set_backend: Reload failed, falling back to CPU");
+        g_ctx.net.clear();
         setup_backend_internal(0);
         g_ctx.net.load_param(g_ctx.param_path.c_str());
         g_ctx.net.load_model(g_ctx.bin_path.c_str());
@@ -690,7 +599,6 @@ int yolo_multitask_set_backend(int backend) {
 }
 
 int yolo_multitask_get_active_task(void) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
     return g_ctx.active_task;
 }
 
@@ -710,32 +618,40 @@ int yolo_multitask_forward_yuv420(
     if (!y_plane || !u_plane || !v_plane) return -2;
     if (width <= 0 || height <= 0) return -3;
 
+    // Per-worker thread affinity and thread count
+    thread_local bool s_thread_init = false;
+    if (!s_thread_init) {
+        ncnn::set_cpu_powersave(2);
+        ncnn::set_omp_num_threads(4);
+        s_thread_init = true;
+    }
+
     std::lock_guard<std::mutex> lock(g_engine_mutex);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     float scale = 1.0f;
-    int pad_w = 0, pad_h = 0, rot_w = width, rot_h = height;
+    int pad_w = 0, pad_h = 0, in_w = 0, in_h = 0, rot_w = width, rot_h = height;
     int target_size = g_ctx.target_size;
 
-    prepare_letterbox_yuv(
+    prepare_letterbox_yuv_stride32(
         y_plane, u_plane, v_plane,
         width, height,
         y_row_stride, uv_row_stride, uv_pixel_stride,
         sensor_orientation,
-        target_size, target_size,
-        scale, pad_w, pad_h, rot_w, rot_h
+        target_size,
+        scale, pad_w, pad_h, in_w, in_h, rot_w, rot_h
     );
 
     auto t_prep = std::chrono::high_resolution_clock::now();
     float prep_ms = std::chrono::duration<float, std::milli>(t_prep - t0).count();
 
     // Create NCNN Mat & Normalize
-    ncnn::Mat in_mat = ncnn::Mat::from_pixels(g_ctx.rgb_letterbox_buf, ncnn::Mat::PIXEL_RGB, target_size, target_size);
+    ncnn::Mat in_mat = ncnn::Mat::from_pixels(g_ctx.rgb_letterbox_buf, ncnn::Mat::PIXEL_RGB, in_w, in_h);
     const float norm_vals[3] = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
     in_mat.substract_mean_normalize(0, norm_vals);
 
-    // Run NCNN Extractor
+    // Forward inference
     ncnn::Extractor ex = g_ctx.net.create_extractor();
     ex.input("in0", in_mat);
 
@@ -752,96 +668,53 @@ int yolo_multitask_forward_yuv420(
     auto t_post_start = std::chrono::high_resolution_clock::now();
     uint32_t current_fid = ++g_ctx.frame_counter;
 
-    // Dispatch by Task
     switch (g_ctx.active_task) {
         case YOLO_TASK_DETECTION: {
             YoloFrameResult* det_res = (YoloFrameResult*)out_result_buffer;
-            // Check if output is in [1, 84, 8400] layout (primary model) or nihui [144, N]
-            if (out0.w == 8400 && out0.h == 84) {
-                // Primary model output: delegate to Rust Core
-                memcpy(g_ctx.raw_output_tensor, (const float*)out0.data, 84 * 8400 * sizeof(float));
-                int rust_ret = yolo_rust_process_frame(
-                    g_ctx.raw_output_tensor,
-                    scale,
-                    (float)pad_w,
-                    (float)pad_h,
-                    current_fid,
-                    det_res
-                );
-                auto t_post_end = std::chrono::high_resolution_clock::now();
-                float track_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-                det_res->frame_id = current_fid;
-                det_res->inference_time_ms = inf_ms;
-                det_res->tracker_time_ms = track_ms;
-                det_res->active_backend = g_ctx.active_backend;
-                det_res->status_code = rust_ret;
-            } else {
-                // Nihui format [144, N]: decode multi-stride proposals
-                std::vector<CandidateObject> proposals;
-                const std::vector<int> strides = {8, 16, 32};
-                int row_offset = 0;
-                for (int s : strides) {
-                    int ngx = target_size / s;
-                    int ngy = target_size / s;
-                    int num_g = ngx * ngy;
-                    decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 80, 0.45f, row_offset, proposals);
-                    row_offset += num_g;
-                }
-                sort_candidates_descent(proposals);
-                std::vector<int> picked;
-                nms_filter_candidates(proposals, picked, 0.45f);
+            det_res->frame_id = current_fid;
+            det_res->inference_time_ms = inf_ms;
+            det_res->active_backend = g_ctx.active_backend;
+            det_res->status_code = 0;
 
-                det_res->frame_id = current_fid;
-                det_res->inference_time_ms = inf_ms;
-                det_res->active_backend = g_ctx.active_backend;
-                det_res->status_code = 0;
-                int count = std::min((int)picked.size(), YOLO_MAX_BOXES);
-                det_res->num_detections = count;
+            // Default prob_threshold = 0.25f matching nihui
+            std::vector<CandidateObject> detections;
+            decode_yolo11_detection(out0, in_w, in_h, pad_w, pad_h, scale, rot_w, rot_h, 0.25f, detections);
 
-                for (int i = 0; i < count; i++) {
-                    const auto& p = proposals[picked[i]];
-                    float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                    float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                    float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                    float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
+            int count = std::min((int)detections.size(), YOLO_MAX_BOXES);
+            det_res->num_detections = count;
 
-                    det_res->boxes[i].x1 = x0;
-                    det_res->boxes[i].y1 = y0;
-                    det_res->boxes[i].x2 = x1;
-                    det_res->boxes[i].y2 = y1;
-                    det_res->boxes[i].confidence = p.prob;
-                    det_res->boxes[i].class_id = p.label;
-                    det_res->boxes[i].track_id = i + 1;
-                    det_res->boxes[i].track_state = YOLO_TRACK_CONFIRMED;
-                    det_res->boxes[i].spatial_zone = (x0 + x1) * 0.5f < rot_w * 0.33f ? YOLO_ZONE_LEFT : ((x0 + x1) * 0.5f > rot_w * 0.66f ? YOLO_ZONE_RIGHT : YOLO_ZONE_CENTER);
-                    det_res->boxes[i].proximity_tier = YOLO_PROXIMITY_MEDIUM;
-                }
-                auto t_post_end = std::chrono::high_resolution_clock::now();
-                det_res->tracker_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
+            // Immediate single-frame output with zero hits >= 2 delay
+            for (int i = 0; i < count; ++i) {
+                const auto& d = detections[i];
+                auto& b = det_res->boxes[i];
+                b.x1 = d.x0;
+                b.y1 = d.y0;
+                b.x2 = d.x1;
+                b.y2 = d.y1;
+                b.confidence = d.prob;
+                b.class_id = d.label;
+                b.track_id = i + 1;
+                b.track_state = 1; // CONFIRMED
+
+                float cx = (d.x0 + d.x1) * 0.5f;
+                b.spatial_zone = (cx < 0.33f) ? 0 : ((cx > 0.66f) ? 2 : 1);
+                float area = (d.x1 - d.x0) * (d.y1 - d.y0);
+                b.proximity_tier = (area > 0.20f) ? 2 : ((area > 0.06f) ? 1 : 0);
             }
+            auto t_post_end = std::chrono::high_resolution_clock::now();
+            det_res->tracker_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
             break;
         }
 
         case YOLO_TASK_SEGMENTATION: {
             YoloSegmentationResult* seg_res = (YoloSegmentationResult*)out_result_buffer;
             ex.extract("out1", out1); // mask coefficients [32, N]
-            ex.extract("out2", out2); // prototype masks [160, 160, 32]
+            ex.extract("out2", out2); // prototype masks [w/4, h/4, 32]
 
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 80, 0.45f, row_offset, proposals);
-                row_offset += num_g;
-            }
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_candidates(proposals, picked, 0.45f);
+            std::vector<CandidateObject> detections;
+            decode_yolo11_detection(out0, in_w, in_h, pad_w, pad_h, scale, rot_w, rot_h, 0.25f, detections);
 
-            int count = std::min((int)picked.size(), MAX_SEG_OBJECTS);
+            int count = std::min((int)detections.size(), MAX_SEG_OBJECTS);
             seg_res->header.task_id = YOLO_TASK_SEGMENTATION;
             seg_res->header.frame_id = current_fid;
             seg_res->header.preprocessing_time_ms = prep_ms;
@@ -850,75 +723,28 @@ int yolo_multitask_forward_yuv420(
             seg_res->header.status_code = 0;
             seg_res->num_objects = count;
 
-            if (count > 0 && out1.w == 32 && out2.c == 32) {
-                // GEMM: multiply mask coefficients with prototype masks
-                ncnn::Mat mask_feat(out1.w, 1, count);
-                for (int i = 0; i < count; i++) {
-                    memcpy(mask_feat.channel(i), out1.row(proposals[picked[i]].gindex), out1.w * sizeof(float));
-                }
+            for (int i = 0; i < count; ++i) {
+                const auto& d = detections[i];
+                auto& obj = seg_res->objects[i];
+                obj.x1 = d.x0;
+                obj.y1 = d.y0;
+                obj.x2 = d.x1;
+                obj.y2 = d.y1;
+                obj.confidence = d.prob;
+                obj.class_id = d.label;
+                obj.mask_w = 32;
+                obj.mask_h = 32;
+                obj.num_contour_points = 16;
 
-                ncnn::Mat objects_mask;
-                {
-                    ncnn::Layer* gemm = ncnn::create_layer("Gemm");
-                    ncnn::ParamDict pd;
-                    pd.set(6, 1);
-                    pd.set(7, count);
-                    pd.set(8, out2.w * out2.h);
-                    pd.set(9, out1.w);
-                    pd.set(10, -1);
-                    pd.set(11, 1);
-                    gemm->load_param(pd);
-                    ncnn::Option opt;
-                    opt.num_threads = 1;
-                    gemm->create_pipeline(opt);
-                    std::vector<ncnn::Mat> g_in = {mask_feat, out2.reshape(out2.w * out2.h, 1, out2.c)};
-                    std::vector<ncnn::Mat> g_out(1);
-                    gemm->forward(g_in, g_out, opt);
-                    objects_mask = g_out[0].reshape(out2.w, out2.h, count);
-                    gemm->destroy_pipeline(opt);
-                    delete gemm;
-                }
-                {
-                    ncnn::Layer* sig = ncnn::create_layer("Sigmoid");
-                    ncnn::Option opt; opt.num_threads = 1;
-                    sig->create_pipeline(opt);
-                    sig->forward_inplace(objects_mask, opt);
-                    sig->destroy_pipeline(opt);
-                    delete sig;
-                }
-
-                // Sample radial contour points around each instance mask
-                for (int i = 0; i < count; i++) {
-                    const auto& p = proposals[picked[i]];
-                    float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                    float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                    float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                    float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
-
-                    seg_res->objects[i].x1 = x0;
-                    seg_res->objects[i].y1 = y0;
-                    seg_res->objects[i].x2 = x1;
-                    seg_res->objects[i].y2 = y1;
-                    seg_res->objects[i].confidence = p.prob;
-                    seg_res->objects[i].class_id = p.label;
-                    seg_res->objects[i].mask_w = (int)(x1 - x0);
-                    seg_res->objects[i].mask_h = (int)(y1 - y0);
-                    seg_res->objects[i].num_contour_points = MAX_CONTOUR_POINTS;
-
-                    // Generate 32 radial contour points
-                    float obj_cx = (x0 + x1) * 0.5f;
-                    float obj_cy = (y0 + y1) * 0.5f;
-                    float rx = (x1 - x0) * 0.5f;
-                    float ry = (y1 - y0) * 0.5f;
-
-                    for (int k = 0; k < MAX_CONTOUR_POINTS; k++) {
-                        float angle = 2.0f * PI_CONST * k / (float)MAX_CONTOUR_POINTS;
-                        // Initial elliptical contour mapped to detection boundary
-                        float px = obj_cx + rx * cosf(angle);
-                        float py = obj_cy + ry * sinf(angle);
-                        seg_res->objects[i].contour_points[k * 2 + 0] = px;
-                        seg_res->objects[i].contour_points[k * 2 + 1] = py;
-                    }
+                // Approximate boundary contour from box for 60 FPS drawing
+                float cx = (d.x0 + d.x1) * 0.5f;
+                float cy = (d.y0 + d.y1) * 0.5f;
+                float rx = (d.x1 - d.x0) * 0.5f;
+                float ry = (d.y1 - d.y0) * 0.5f;
+                for (int p = 0; p < 16; ++p) {
+                    float theta = (float)(2.0 * M_PI * p / 16.0);
+                    obj.contour_points[p * 2 + 0] = std::max(0.0f, std::min(1.0f, cx + rx * cosf(theta)));
+                    obj.contour_points[p * 2 + 1] = std::max(0.0f, std::min(1.0f, cy + ry * sinf(theta)));
                 }
             }
             auto t_post_end = std::chrono::high_resolution_clock::now();
@@ -928,23 +754,12 @@ int yolo_multitask_forward_yuv420(
 
         case YOLO_TASK_POSE: {
             YoloPoseResult* pose_res = (YoloPoseResult*)out_result_buffer;
-            ex.extract("out1", out1); // keypoints tensor [51, N]
+            ex.extract("out1", out1); // 17 keypoints [51, N]
 
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 1, 0.45f, row_offset, proposals);
-                row_offset += num_g;
-            }
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_candidates(proposals, picked, 0.45f);
+            std::vector<CandidateObject> detections;
+            decode_yolo11_detection(out0, in_w, in_h, pad_w, pad_h, scale, rot_w, rot_h, 0.25f, detections);
 
-            int count = std::min((int)picked.size(), MAX_POSE_OBJECTS);
+            int count = std::min((int)detections.size(), MAX_POSE_OBJECTS);
             pose_res->header.task_id = YOLO_TASK_POSE;
             pose_res->header.frame_id = current_fid;
             pose_res->header.preprocessing_time_ms = prep_ms;
@@ -953,30 +768,24 @@ int yolo_multitask_forward_yuv420(
             pose_res->header.status_code = 0;
             pose_res->num_objects = count;
 
-            for (int i = 0; i < count; i++) {
-                const auto& p = proposals[picked[i]];
-                float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
+            for (int i = 0; i < count; ++i) {
+                const auto& d = detections[i];
+                auto& p_obj = pose_res->objects[i];
+                p_obj.x1 = d.x0;
+                p_obj.y1 = d.y0;
+                p_obj.x2 = d.x1;
+                p_obj.y2 = d.y1;
+                p_obj.confidence = d.prob;
+                p_obj.class_id = d.label;
 
-                pose_res->objects[i].x1 = x0;
-                pose_res->objects[i].y1 = y0;
-                pose_res->objects[i].x2 = x1;
-                pose_res->objects[i].y2 = y1;
-                pose_res->objects[i].confidence = p.prob;
-                pose_res->objects[i].class_id = 0; // Person
-
-                // Extract 17 keypoints if out1 available
-                if (out1.h > p.gindex && out1.w >= 51) {
-                    const float* kp_row = out1.row(p.gindex);
-                    for (int k = 0; k < POSE_KEYPOINTS_COUNT; k++) {
-                        float kpx = (kp_row[k * 3 + 0] * target_size - pad_w) / scale;
-                        float kpy = (kp_row[k * 3 + 1] * target_size - pad_h) / scale;
-                        float kpc = fast_sigmoid(kp_row[k * 3 + 2]);
-                        pose_res->objects[i].keypoints[k].x = std::max(0.0f, std::min((float)(rot_w - 1), kpx));
-                        pose_res->objects[i].keypoints[k].y = std::max(0.0f, std::min((float)(rot_h - 1), kpy));
-                        pose_res->objects[i].keypoints[k].confidence = kpc;
+                if (d.anchor_idx < out1.h && out1.w >= 51) {
+                    const float* kp_ptr = out1.row(d.anchor_idx);
+                    for (int k = 0; k < POSE_KEYPOINTS_COUNT; ++k) {
+                        float kpx = (kp_ptr[k * 3 + 0] - pad_w) / (scale * rot_w);
+                        float kpy = (kp_ptr[k * 3 + 1] - pad_h) / (scale * rot_h);
+                        p_obj.keypoints[k].x = std::max(0.0f, std::min(1.0f, kpx));
+                        p_obj.keypoints[k].y = std::max(0.0f, std::min(1.0f, kpy));
+                        p_obj.keypoints[k].confidence = fast_sigmoid(kp_ptr[k * 3 + 2]);
                     }
                 }
             }
@@ -994,88 +803,28 @@ int yolo_multitask_forward_yuv420(
             cls_res->header.active_backend = g_ctx.active_backend;
             cls_res->header.status_code = 0;
 
-            int num_cls = out0.w * out0.h;
-            std::vector<std::pair<float, int>> scores(num_cls);
-            for (int k = 0; k < num_cls; k++) {
-                scores[k] = std::make_pair(out0[k], k);
+            const float* probs = (const float*)out0.data;
+            int num_cls = out0.w * out0.h * out0.c;
+            std::vector<std::pair<float, int>> topk;
+            for (int c = 0; c < num_cls; ++c) {
+                topk.push_back({probs[c], c});
             }
-            std::partial_sort(scores.begin(), scores.begin() + MAX_TOPK, scores.end(),
+            std::partial_sort(topk.begin(), topk.begin() + std::min(5, (int)topk.size()), topk.end(),
                               std::greater<std::pair<float, int>>());
 
-            cls_res->num_items = MAX_TOPK;
-            for (int k = 0; k < MAX_TOPK; k++) {
-                cls_res->items[k].class_id = scores[k].second;
-                cls_res->items[k].confidence = scores[k].first;
+            int k = std::min(MAX_TOPK, (int)topk.size());
+            cls_res->num_items = k;
+            for (int i = 0; i < k; ++i) {
+                cls_res->items[i].confidence = topk[i].first;
+                cls_res->items[i].class_id = topk[i].second;
             }
             auto t_post_end = std::chrono::high_resolution_clock::now();
             cls_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
             break;
         }
 
-        case YOLO_TASK_OBB: {
-            YoloObbResult* obb_res = (YoloObbResult*)out_result_buffer;
-            ex.extract("out1", out1); // Angle tensor [1, N]
-
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 15, 0.40f, row_offset, proposals);
-                row_offset += num_g;
-            }
-
-            // Extract angles and compute 4 corners for each candidate
-            for (auto& obj : proposals) {
-                float raw_angle = (out1.h > obj.gindex) ? out1.row(obj.gindex)[0] : 0.0f;
-                float angle = fast_sigmoid(raw_angle) - 0.25f;
-                obj.angle_rad = angle * PI_CONST;
-                obj.angle_deg = angle * 180.0f;
-
-                // Adjust to original coordinates
-                float cx_orig = (obj.cx - pad_w) / scale;
-                float cy_orig = (obj.cy - pad_h) / scale;
-                float w_orig = obj.w / scale;
-                float h_orig = obj.h / scale;
-                obj.cx = cx_orig;
-                obj.cy = cy_orig;
-                obj.w = w_orig;
-                obj.h = h_orig;
-
-                compute_obb_corners(cx_orig, cy_orig, w_orig, h_orig, obj.angle_rad, obj.corners);
-            }
-
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_obb(proposals, picked, 0.40f);
-
-            int count = std::min((int)picked.size(), MAX_OBB_OBJECTS);
-            obb_res->header.task_id = YOLO_TASK_OBB;
-            obb_res->header.frame_id = current_fid;
-            obb_res->header.preprocessing_time_ms = prep_ms;
-            obb_res->header.inference_time_ms = inf_ms;
-            obb_res->header.active_backend = g_ctx.active_backend;
-            obb_res->header.status_code = 0;
-            obb_res->num_objects = count;
-
-            for (int i = 0; i < count; i++) {
-                const auto& p = proposals[picked[i]];
-                obb_res->objects[i].cx = p.cx;
-                obb_res->objects[i].cy = p.cy;
-                obb_res->objects[i].width = p.w;
-                obb_res->objects[i].height = p.h;
-                obb_res->objects[i].angle_rad = p.angle_rad;
-                obb_res->objects[i].angle_deg = p.angle_deg;
-                memcpy(obb_res->objects[i].corners, p.corners, 8 * sizeof(float));
-                obb_res->objects[i].confidence = p.prob;
-                obb_res->objects[i].class_id = p.label;
-            }
-            auto t_post_end = std::chrono::high_resolution_clock::now();
-            obb_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
+        default:
             break;
-        }
     }
 
     return 0;
@@ -1088,27 +837,35 @@ int yolo_multitask_forward_rgba(
     int sensor_orientation,
     void* out_result_buffer
 ) {
-    if (!g_ctx.initialized || !out_result_buffer) return -1;
-    if (!rgba || width <= 0 || height <= 0) return -2;
+    if (!g_ctx.initialized || !out_result_buffer || !rgba) return -1;
+    if (width <= 0 || height <= 0) return -2;
+
+    thread_local bool s_thread_init = false;
+    if (!s_thread_init) {
+        ncnn::set_cpu_powersave(2);
+        ncnn::set_omp_num_threads(4);
+        s_thread_init = true;
+    }
 
     std::lock_guard<std::mutex> lock(g_engine_mutex);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     float scale = 1.0f;
-    int pad_w = 0, pad_h = 0, rot_w = width, rot_h = height;
+    int pad_w = 0, pad_h = 0, in_w = 0, in_h = 0, rot_w = width, rot_h = height;
     int target_size = g_ctx.target_size;
 
-    prepare_letterbox_rgba(
-        rgba, width, height, sensor_orientation,
-        target_size, target_size,
-        scale, pad_w, pad_h, rot_w, rot_h
+    prepare_letterbox_rgba_stride32(
+        rgba, width, height,
+        sensor_orientation,
+        target_size,
+        scale, pad_w, pad_h, in_w, in_h, rot_w, rot_h
     );
 
     auto t_prep = std::chrono::high_resolution_clock::now();
     float prep_ms = std::chrono::duration<float, std::milli>(t_prep - t0).count();
 
-    ncnn::Mat in_mat = ncnn::Mat::from_pixels(g_ctx.rgb_letterbox_buf, ncnn::Mat::PIXEL_RGB, target_size, target_size);
+    ncnn::Mat in_mat = ncnn::Mat::from_pixels(g_ctx.rgb_letterbox_buf, ncnn::Mat::PIXEL_RGB, in_w, in_h);
     const float norm_vals[3] = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
     in_mat.substract_mean_normalize(0, norm_vals);
 
@@ -1116,7 +873,7 @@ int yolo_multitask_forward_rgba(
     ex.input("in0", in_mat);
 
     auto t_inf_start = std::chrono::high_resolution_clock::now();
-    ncnn::Mat out0, out1, out2;
+    ncnn::Mat out0;
     int ret = ex.extract("out0", out0);
     if (ret != 0) {
         LOGE("NCNN extract out0 failed (%d)", ret);
@@ -1128,276 +885,38 @@ int yolo_multitask_forward_rgba(
     auto t_post_start = std::chrono::high_resolution_clock::now();
     uint32_t current_fid = ++g_ctx.frame_counter;
 
-    switch (g_ctx.active_task) {
-        case YOLO_TASK_DETECTION: {
-            YoloFrameResult* det_res = (YoloFrameResult*)out_result_buffer;
-            if (out0.w == 8400 && out0.h == 84) {
-                memcpy(g_ctx.raw_output_tensor, (const float*)out0.data, 84 * 8400 * sizeof(float));
-                int rust_ret = yolo_rust_process_frame(
-                    g_ctx.raw_output_tensor, scale, (float)pad_w, (float)pad_h, current_fid, det_res
-                );
-                auto t_post_end = std::chrono::high_resolution_clock::now();
-                float track_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-                det_res->frame_id = current_fid;
-                det_res->inference_time_ms = inf_ms;
-                det_res->tracker_time_ms = track_ms;
-                det_res->active_backend = g_ctx.active_backend;
-                det_res->status_code = rust_ret;
-            } else {
-                std::vector<CandidateObject> proposals;
-                const std::vector<int> strides = {8, 16, 32};
-                int row_offset = 0;
-                for (int s : strides) {
-                    int ngx = target_size / s;
-                    int ngy = target_size / s;
-                    int num_g = ngx * ngy;
-                    decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 80, 0.45f, row_offset, proposals);
-                    row_offset += num_g;
-                }
-                sort_candidates_descent(proposals);
-                std::vector<int> picked;
-                nms_filter_candidates(proposals, picked, 0.45f);
+    YoloFrameResult* det_res = (YoloFrameResult*)out_result_buffer;
+    det_res->frame_id = current_fid;
+    det_res->inference_time_ms = inf_ms;
+    det_res->active_backend = g_ctx.active_backend;
+    det_res->status_code = 0;
 
-                det_res->frame_id = current_fid;
-                det_res->inference_time_ms = inf_ms;
-                det_res->active_backend = g_ctx.active_backend;
-                det_res->status_code = 0;
-                int count = std::min((int)picked.size(), YOLO_MAX_BOXES);
-                det_res->num_detections = count;
+    std::vector<CandidateObject> detections;
+    decode_yolo11_detection(out0, in_w, in_h, pad_w, pad_h, scale, rot_w, rot_h, 0.25f, detections);
 
-                for (int i = 0; i < count; i++) {
-                    const auto& p = proposals[picked[i]];
-                    float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                    float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                    float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                    float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
+    int count = std::min((int)detections.size(), YOLO_MAX_BOXES);
+    det_res->num_detections = count;
 
-                    det_res->boxes[i].x1 = x0;
-                    det_res->boxes[i].y1 = y0;
-                    det_res->boxes[i].x2 = x1;
-                    det_res->boxes[i].y2 = y1;
-                    det_res->boxes[i].confidence = p.prob;
-                    det_res->boxes[i].class_id = p.label;
-                    det_res->boxes[i].track_id = i + 1;
-                    det_res->boxes[i].track_state = YOLO_TRACK_CONFIRMED;
-                    det_res->boxes[i].spatial_zone = (x0 + x1) * 0.5f < rot_w * 0.33f ? YOLO_ZONE_LEFT : ((x0 + x1) * 0.5f > rot_w * 0.66f ? YOLO_ZONE_RIGHT : YOLO_ZONE_CENTER);
-                    det_res->boxes[i].proximity_tier = YOLO_PROXIMITY_MEDIUM;
-                }
-                auto t_post_end = std::chrono::high_resolution_clock::now();
-                det_res->tracker_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-            }
-            break;
-        }
+    for (int i = 0; i < count; ++i) {
+        const auto& d = detections[i];
+        auto& b = det_res->boxes[i];
+        b.x1 = d.x0;
+        b.y1 = d.y0;
+        b.x2 = d.x1;
+        b.y2 = d.y1;
+        b.confidence = d.prob;
+        b.class_id = d.label;
+        b.track_id = i + 1;
+        b.track_state = 1;
 
-        case YOLO_TASK_SEGMENTATION: {
-            YoloSegmentationResult* seg_res = (YoloSegmentationResult*)out_result_buffer;
-            ex.extract("out1", out1);
-            ex.extract("out2", out2);
-
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 80, 0.45f, row_offset, proposals);
-                row_offset += num_g;
-            }
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_candidates(proposals, picked, 0.45f);
-
-            int count = std::min((int)picked.size(), MAX_SEG_OBJECTS);
-            seg_res->header.task_id = YOLO_TASK_SEGMENTATION;
-            seg_res->header.frame_id = current_fid;
-            seg_res->header.preprocessing_time_ms = prep_ms;
-            seg_res->header.inference_time_ms = inf_ms;
-            seg_res->header.active_backend = g_ctx.active_backend;
-            seg_res->header.status_code = 0;
-            seg_res->num_objects = count;
-
-            for (int i = 0; i < count; i++) {
-                const auto& p = proposals[picked[i]];
-                float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
-
-                seg_res->objects[i].x1 = x0;
-                seg_res->objects[i].y1 = y0;
-                seg_res->objects[i].x2 = x1;
-                seg_res->objects[i].y2 = y1;
-                seg_res->objects[i].confidence = p.prob;
-                seg_res->objects[i].class_id = p.label;
-                seg_res->objects[i].mask_w = (int)(x1 - x0);
-                seg_res->objects[i].mask_h = (int)(y1 - y0);
-                seg_res->objects[i].num_contour_points = MAX_CONTOUR_POINTS;
-
-                float obj_cx = (x0 + x1) * 0.5f;
-                float obj_cy = (y0 + y1) * 0.5f;
-                float rx = (x1 - x0) * 0.5f;
-                float ry = (y1 - y0) * 0.5f;
-
-                for (int k = 0; k < MAX_CONTOUR_POINTS; k++) {
-                    float angle = 2.0f * PI_CONST * k / (float)MAX_CONTOUR_POINTS;
-                    seg_res->objects[i].contour_points[k * 2 + 0] = obj_cx + rx * cosf(angle);
-                    seg_res->objects[i].contour_points[k * 2 + 1] = obj_cy + ry * sinf(angle);
-                }
-            }
-            auto t_post_end = std::chrono::high_resolution_clock::now();
-            seg_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-            break;
-        }
-
-        case YOLO_TASK_POSE: {
-            YoloPoseResult* pose_res = (YoloPoseResult*)out_result_buffer;
-            ex.extract("out1", out1);
-
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 1, 0.45f, row_offset, proposals);
-                row_offset += num_g;
-            }
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_candidates(proposals, picked, 0.45f);
-
-            int count = std::min((int)picked.size(), MAX_POSE_OBJECTS);
-            pose_res->header.task_id = YOLO_TASK_POSE;
-            pose_res->header.frame_id = current_fid;
-            pose_res->header.preprocessing_time_ms = prep_ms;
-            pose_res->header.inference_time_ms = inf_ms;
-            pose_res->header.active_backend = g_ctx.active_backend;
-            pose_res->header.status_code = 0;
-            pose_res->num_objects = count;
-
-            for (int i = 0; i < count; i++) {
-                const auto& p = proposals[picked[i]];
-                float x0 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x0 - pad_w) / scale));
-                float y0 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y0 - pad_h) / scale));
-                float x1 = std::max(0.0f, std::min((float)(rot_w - 1), (p.x1 - pad_w) / scale));
-                float y1 = std::max(0.0f, std::min((float)(rot_h - 1), (p.y1 - pad_h) / scale));
-
-                pose_res->objects[i].x1 = x0;
-                pose_res->objects[i].y1 = y0;
-                pose_res->objects[i].x2 = x1;
-                pose_res->objects[i].y2 = y1;
-                pose_res->objects[i].confidence = p.prob;
-                pose_res->objects[i].class_id = 0;
-
-                if (out1.h > p.gindex && out1.w >= 51) {
-                    const float* kp_row = out1.row(p.gindex);
-                    for (int k = 0; k < POSE_KEYPOINTS_COUNT; k++) {
-                        float kpx = (kp_row[k * 3 + 0] * target_size - pad_w) / scale;
-                        float kpy = (kp_row[k * 3 + 1] * target_size - pad_h) / scale;
-                        float kpc = fast_sigmoid(kp_row[k * 3 + 2]);
-                        pose_res->objects[i].keypoints[k].x = std::max(0.0f, std::min((float)(rot_w - 1), kpx));
-                        pose_res->objects[i].keypoints[k].y = std::max(0.0f, std::min((float)(rot_h - 1), kpy));
-                        pose_res->objects[i].keypoints[k].confidence = kpc;
-                    }
-                }
-            }
-            auto t_post_end = std::chrono::high_resolution_clock::now();
-            pose_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-            break;
-        }
-
-        case YOLO_TASK_CLASSIFICATION: {
-            YoloClassificationResult* cls_res = (YoloClassificationResult*)out_result_buffer;
-            cls_res->header.task_id = YOLO_TASK_CLASSIFICATION;
-            cls_res->header.frame_id = current_fid;
-            cls_res->header.preprocessing_time_ms = prep_ms;
-            cls_res->header.inference_time_ms = inf_ms;
-            cls_res->header.active_backend = g_ctx.active_backend;
-            cls_res->header.status_code = 0;
-
-            int num_cls = out0.w * out0.h;
-            std::vector<std::pair<float, int>> scores(num_cls);
-            for (int k = 0; k < num_cls; k++) {
-                scores[k] = std::make_pair(out0[k], k);
-            }
-            std::partial_sort(scores.begin(), scores.begin() + MAX_TOPK, scores.end(),
-                              std::greater<std::pair<float, int>>());
-
-            cls_res->num_items = MAX_TOPK;
-            for (int k = 0; k < MAX_TOPK; k++) {
-                cls_res->items[k].class_id = scores[k].second;
-                cls_res->items[k].confidence = scores[k].first;
-            }
-            auto t_post_end = std::chrono::high_resolution_clock::now();
-            cls_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-            break;
-        }
-
-        case YOLO_TASK_OBB: {
-            YoloObbResult* obb_res = (YoloObbResult*)out_result_buffer;
-            ex.extract("out1", out1);
-
-            std::vector<CandidateObject> proposals;
-            const std::vector<int> strides = {8, 16, 32};
-            int row_offset = 0;
-            for (int s : strides) {
-                int ngx = target_size / s;
-                int ngy = target_size / s;
-                int num_g = ngx * ngy;
-                decode_yolo11_grid_proposals(out0.row_range(row_offset, num_g), s, target_size, target_size, 16, 15, 0.40f, row_offset, proposals);
-                row_offset += num_g;
-            }
-
-            for (auto& obj : proposals) {
-                float raw_angle = (out1.h > obj.gindex) ? out1.row(obj.gindex)[0] : 0.0f;
-                float angle = fast_sigmoid(raw_angle) - 0.25f;
-                obj.angle_rad = angle * PI_CONST;
-                obj.angle_deg = angle * 180.0f;
-
-                float cx_orig = (obj.cx - pad_w) / scale;
-                float cy_orig = (obj.cy - pad_h) / scale;
-                float w_orig = obj.w / scale;
-                float h_orig = obj.h / scale;
-                obj.cx = cx_orig;
-                obj.cy = cy_orig;
-                obj.w = w_orig;
-                obj.h = h_orig;
-
-                compute_obb_corners(cx_orig, cy_orig, w_orig, h_orig, obj.angle_rad, obj.corners);
-            }
-
-            sort_candidates_descent(proposals);
-            std::vector<int> picked;
-            nms_filter_obb(proposals, picked, 0.40f);
-
-            int count = std::min((int)picked.size(), MAX_OBB_OBJECTS);
-            obb_res->header.task_id = YOLO_TASK_OBB;
-            obb_res->header.frame_id = current_fid;
-            obb_res->header.preprocessing_time_ms = prep_ms;
-            obb_res->header.inference_time_ms = inf_ms;
-            obb_res->header.active_backend = g_ctx.active_backend;
-            obb_res->header.status_code = 0;
-            obb_res->num_objects = count;
-
-            for (int i = 0; i < count; i++) {
-                const auto& p = proposals[picked[i]];
-                obb_res->objects[i].cx = p.cx;
-                obb_res->objects[i].cy = p.cy;
-                obb_res->objects[i].width = p.w;
-                obb_res->objects[i].height = p.h;
-                obb_res->objects[i].angle_rad = p.angle_rad;
-                obb_res->objects[i].angle_deg = p.angle_deg;
-                memcpy(obb_res->objects[i].corners, p.corners, 8 * sizeof(float));
-                obb_res->objects[i].confidence = p.prob;
-                obb_res->objects[i].class_id = p.label;
-            }
-            auto t_post_end = std::chrono::high_resolution_clock::now();
-            obb_res->header.postprocessing_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
-            break;
-        }
+        float cx = (d.x0 + d.x1) * 0.5f;
+        b.spatial_zone = (cx < 0.33f) ? 0 : ((cx > 0.66f) ? 2 : 1);
+        float area = (d.x1 - d.x0) * (d.y1 - d.y0);
+        b.proximity_tier = (area > 0.20f) ? 2 : ((area > 0.06f) ? 1 : 0);
     }
+
+    auto t_post_end = std::chrono::high_resolution_clock::now();
+    det_res->tracker_time_ms = std::chrono::duration<float, std::milli>(t_post_end - t_post_start).count();
 
     return 0;
 }
@@ -1406,11 +925,8 @@ void yolo_multitask_destroy(void) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (!g_ctx.initialized) return;
 
-    if (g_ctx.active_task == YOLO_TASK_DETECTION) {
-        yolo_rust_destroy();
-    }
-
     g_ctx.net.clear();
+
 #if NCNN_VULKAN
     if (g_ctx.gpu_instance_created) {
         ncnn::destroy_gpu_instance();
@@ -1418,6 +934,7 @@ void yolo_multitask_destroy(void) {
         g_ctx.current_gpu_driver = -1;
     }
 #endif
+
     g_ctx.initialized = false;
     LOGI("yolo_multitask_destroy: SUCCESS");
 }

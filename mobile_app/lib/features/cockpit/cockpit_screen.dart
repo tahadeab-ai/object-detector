@@ -14,12 +14,9 @@ import '../../core/services/diagnostics_service.dart';
 import '../../core/services/inference_worker.dart';
 import '../../core/services/model_manager.dart';
 import '../../core/theme/design_tokens.dart';
-import '../dashboard/performance_dashboard_screen.dart';
 import '../diagnostics/diagnostics_screen.dart';
-import '../model_manager/model_manager_screen.dart';
 import '../sample_mode/sample_benchmark_view.dart';
 import '../settings/engine_settings_sheet.dart';
-import 'bbox_hud_painter.dart';
 import 'cockpit_bottom_dock.dart';
 import 'multitask_hud_painter.dart';
 import 'task_selector_strip.dart';
@@ -46,7 +43,7 @@ class _CockpitScreenState extends State<CockpitScreen>
   bool _isTorchOn = false;
   bool _isFrozen = false;
 
-  double _confThreshold = 0.45;
+  double _confThreshold = 0.25;
   double _iouThreshold = 0.45;
   int _activeBackend = 0; // 0=CPU (NEON 4T), 1=Vulkan
 
@@ -68,9 +65,8 @@ class _CockpitScreenState extends State<CockpitScreen>
   int _frameCounter = 0;
   DateTime _lastFpsUpdate = DateTime.now();
 
-  // Watchdog: alert if no frames processed within 5 seconds of camera running
+  // Watchdog: silent automatic worker recovery
   Timer? _watchdogTimer;
-  bool _watchdogFired = false;
   String? _cameraErrorMessage;
   int _selectedCameraIndex = 0;
 
@@ -216,13 +212,11 @@ class _CockpitScreenState extends State<CockpitScreen>
 
   void _resetWatchdog() {
     _watchdogTimer?.cancel();
-    _watchdogFired = false;
-    _watchdogTimer = Timer(const Duration(seconds: 5), () {
+    _watchdogTimer = Timer(const Duration(milliseconds: 1500), () {
       if (!mounted) return;
-      if (_isCameraInitialized && (_cameraController?.value.isStreamingImages ?? false)) {
-        setState(() {
-          _watchdogFired = true;
-        });
+      // Silent automatic worker lock recovery if frame processing ever stalls
+      if (_isProcessingFrame) {
+        _isProcessingFrame = false;
       }
     });
   }
@@ -391,10 +385,16 @@ class _CockpitScreenState extends State<CockpitScreen>
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
+      isScrollControlled: true,
       builder: (ctx) => EngineSettingsSheet(
         initialConfThreshold: _confThreshold,
         initialIouThreshold: _iouThreshold,
         isArabic: _isArabic,
+        currentResolution: _modelManager.activeResolution,
+        onResolutionChanged: (res) => _modelManager.setResolution(res),
+        isTorchOn: _isTorchOn,
+        onToggleTorch: _toggleTorch,
+        onOpenDiagnostics: _openDiagnostics,
         onConfChanged: (val) => setState(() => _confThreshold = val),
         onIouChanged: (val) => setState(() => _iouThreshold = val),
       ),
@@ -432,10 +432,6 @@ class _CockpitScreenState extends State<CockpitScreen>
     }
   }
 
-  void _onModelManagerChanged() {
-    if (mounted) setState(() {});
-  }
-
   Future<void> _onTaskChanged(VisionTask task) async {
     if (_modelManager.activeTask == task) return;
 
@@ -458,22 +454,8 @@ class _CockpitScreenState extends State<CockpitScreen>
     }
   }
 
-  void _openModelManager() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ModelManagerScreen(isArabic: _isArabic),
-      ),
-    );
-  }
-
-  void _openPerformanceDashboard() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => PerformanceDashboardScreen(isArabic: _isArabic),
-      ),
-    );
+  void _onModelManagerChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -539,114 +521,7 @@ class _CockpitScreenState extends State<CockpitScreen>
           else
             _buildFallbackState(),
 
-          // 2. Subtle Watermark when Scene is Empty
-          if (_isCameraInitialized &&
-              !_isLoadingCamera &&
-              _currentDetections.isEmpty &&
-              !_watchdogFired)
-            Positioned(
-              bottom: 80,
-              left: 20,
-              right: 20,
-              child: Center(
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: AppTokens.surfaceGlass,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: AppTokens.hairline),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.radar_rounded,
-                          size: 14, color: AppTokens.accent),
-                      const SizedBox(width: 6),
-                      Text(
-                        _isArabic
-                            ? 'بانتظار رصد أهداف في المشهد'
-                            : 'Scanning scene for objects...',
-                        style: const TextStyle(
-                          fontFamily: AppTokens.fontCairo,
-                          color: AppTokens.muted,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-
-          // 3. Watchdog Error Banner (if stalled >= 5s)
-          if (_watchdogFired)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 60,
-              left: 16,
-              right: 16,
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF3B1214),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppTokens.danger),
-                  boxShadow: const [
-                    BoxShadow(color: Colors.black54, blurRadius: 8),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.warning_amber_rounded,
-                        color: AppTokens.danger, size: 24),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            _isArabic
-                                ? 'تنبيه: توقف تدفق الإطارات'
-                                : 'Watchdog: Frame Stream Stalled',
-                            style: const TextStyle(
-                              fontFamily: AppTokens.fontCairo,
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 12,
-                            ),
-                          ),
-                          Text(
-                            _isArabic
-                                ? 'لم تتم معالجة أي إطار خلال 5 ثوانٍ.'
-                                : 'No frames processed within 5 seconds.',
-                            style: const TextStyle(
-                              fontFamily: AppTokens.fontCairo,
-                              color: Colors.white70,
-                              fontSize: 11,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _openDiagnostics,
-                      child: Text(
-                        _isArabic ? 'التشخيص' : 'Diagnostics',
-                        style: const TextStyle(
-                          fontFamily: AppTokens.fontCairo,
-                          color: AppTokens.accent,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-          // 4. Minimal Glassmorphic Top Pill HUD (height <= 48px)
+          // 2. Minimal Glassmorphic Top Pill HUD (height <= 48px)
           Positioned(
             top: MediaQuery.of(context).padding.top + 8,
             left: 16,
@@ -661,9 +536,9 @@ class _CockpitScreenState extends State<CockpitScreen>
             ),
           ),
 
-          // 5. Tactical Task Navigation Strip (Detection, Seg, Pose, Cls, OBB)
+          // 3. Tactical Task Selector Strip (Detection, Seg, Pose, Cls) - Zero Overlap at top: 64px
           Positioned(
-            top: MediaQuery.of(context).padding.top + 62,
+            top: MediaQuery.of(context).padding.top + 64,
             left: 0,
             right: 0,
             child: Center(
@@ -676,7 +551,7 @@ class _CockpitScreenState extends State<CockpitScreen>
             ),
           ),
 
-          // 6. Minimal Tactical Floating Bottom Dock
+          // 4. Clean Tactical 5-Button Floating Bottom Dock
           Positioned(
             bottom: MediaQuery.of(context).padding.bottom + 12,
             left: 16,
@@ -684,17 +559,12 @@ class _CockpitScreenState extends State<CockpitScreen>
             child: Center(
               child: CockpitBottomDock(
                 isArabic: _isArabic,
-                isTorchOn: _isTorchOn,
                 isFrozen: _isFrozen,
                 onToggleLanguage: _toggleLanguage,
                 onOpenSampleMode: _openSampleMode,
-                onToggleTorch: _toggleTorch,
                 onToggleFreeze: _toggleFreeze,
-                onOpenSettings: _openSettings,
-                onOpenDiagnostics: _openDiagnostics,
                 onSwitchCamera: _switchCamera,
-                onOpenModelManager: _openModelManager,
-                onOpenPerformanceDashboard: _openPerformanceDashboard,
+                onOpenSettings: _openSettings,
               ),
             ),
           ),
