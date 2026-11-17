@@ -45,6 +45,10 @@ mobile_app/android/key.properties
 signing/
 secrets/
 
+# --- Reference Repositories (Do not commit) ---
+reference/
+scripts/fetch_reference.py
+
 # --- C++ / CMake / Android NDK Build Directories ---
 CMakeFiles/
 CMakeScripts/
