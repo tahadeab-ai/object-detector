@@ -93,3 +93,17 @@ All sample images bundled for offline benchmarking are permissively licensed:
 - **Go Standard Library**: BSD 3-Clause License (The Go Authors).
 - **Fiber Web Framework**: MIT License (Copyright (c) 2019-2026 Fiber Authors).
 - **go-redis**: BSD 2-Clause License (Copyright (c) 2013 The go-redis Authors).
+
+---
+
+## 9. Branding, Icons & Typography Assets
+
+- **App Launcher & Adaptive Icons (`branding/`)**:
+  - `icon.svg`, `icon.png`, `icon_foreground.png`, `icon_background.png`, `icon_monochrome.png`.
+  - Design & Artwork: Custom vector artwork created specifically for this project (detection corner brackets enclosing a camera lens aperture with target reticle).
+  - License: Dedicated to the public domain under Creative Commons Zero v1.0 Universal (CC0 1.0) / MIT License.
+  - Copyright: (c) 2026 Taha Deab.
+
+- **System Fonts**:
+  - Uses default Android system sans-serif font stack (Roboto, Noto Sans Arabic) provided natively by Android OS.
+

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Corner Brackets in solid white -->
+  <path d="M 252 380 L 252 284 A 32 32 0 0 1 284 252 L 380 252"
+        fill="none" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 644 252 L 740 252 A 32 32 0 0 1 772 284 L 772 380"
+        fill="none" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 772 644 L 772 740 A 32 32 0 0 1 740 772 L 644 772"
+        fill="none" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 380 772 L 284 772 A 32 32 0 0 1 252 740 L 252 644"
+        fill="none" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="284" cy="252" r="16" fill="#FFFFFF"/>
+  <circle cx="740" cy="772" r="16" fill="#FFFFFF"/>
+
+  <!-- Lens Aperture Outline -->
+  <circle cx="512" cy="512" r="192" fill="none" stroke="#FFFFFF" stroke-width="16"/>
+
+  <!-- Aperture Blades -->
+  <path d="M 512 332 L 620 400 L 570 480 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M 668 422 L 668 546 L 575 510 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M 620 624 L 512 692 L 512 590 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M 404 624 L 356 502 L 450 510 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M 356 422 L 404 332 L 450 434 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+  <path d="M 512 332 L 404 332 L 512 434 Z" fill="none" stroke="#FFFFFF" stroke-width="6"/>
+
+  <!-- Center Iris & Core -->
+  <polygon points="512,442 572,477 572,547 512,582 452,547 452,477"
+           fill="none" stroke="#FFFFFF" stroke-width="12"/>
+  <circle cx="512" cy="512" r="32" fill="#FFFFFF"/>
+  <line x1="512" y1="400" x2="512" y2="422" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <line x1="512" y1="602" x2="512" y2="624" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <line x1="400" y1="512" x2="422" y2="512" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+  <line x1="602" y1="512" x2="624" y2="512" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round"/>
+</svg>
