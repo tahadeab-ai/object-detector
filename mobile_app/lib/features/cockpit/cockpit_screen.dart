@@ -9,11 +9,12 @@ import '../../core/services/camera_permission_service.dart';
 import '../../core/services/detection_event_bus.dart';
 import '../../core/services/diagnostics_service.dart';
 import '../../core/services/inference_worker.dart';
-import '../../core/services/telemetry_sync_client.dart';
+import '../../core/theme/design_tokens.dart';
 import '../diagnostics/diagnostics_screen.dart';
 import '../sample_mode/sample_benchmark_view.dart';
 import '../settings/engine_settings_sheet.dart';
 import 'bbox_hud_painter.dart';
+import 'cockpit_bottom_dock.dart';
 import 'telemetry_top_bar.dart';
 
 class CockpitScreen extends StatefulWidget {
@@ -34,35 +35,34 @@ class _CockpitScreenState extends State<CockpitScreen>
   bool _isLoadingCamera = false;
   bool _isProcessingFrame = false;
   bool _isArabic = false;
+  bool _isTorchOn = false;
+  bool _isFrozen = false;
 
-  double _confThreshold = 0.25;
+  double _confThreshold = 0.45;
   double _iouThreshold = 0.45;
-  int _activeBackend = 0; // 0=CPU, 1=Vulkan
+  int _activeBackend = 0; // 0=CPU (NEON 4T), 1=Vulkan
 
   List<DetectionItem> _currentDetections = [];
   EngineTelemetry _currentTelemetry = const EngineTelemetry();
 
   StreamSubscription<FrameDetectionEvent>? _eventSub;
-  late final TelemetrySyncClient _syncClient;
   final CocoLabelsRepository _labelsRepo = CocoLabelsRepository();
   final DiagnosticsService _diagService = DiagnosticsService();
   final InferenceWorker _inferenceWorker = InferenceWorker();
 
   int _frameCounter = 0;
   DateTime _lastFpsUpdate = DateTime.now();
-  DateTime _lastInferenceTime = DateTime.now();
-  DateTime _lastSyncDispatch = DateTime.now();
 
   // Watchdog: alert if no frames processed within 5 seconds of camera running
   Timer? _watchdogTimer;
   bool _watchdogFired = false;
   String? _cameraErrorMessage;
+  int _selectedCameraIndex = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _syncClient = TelemetrySyncClient();
     _labelsRepo.load();
     _availableCameras = List.from(widget.cameras);
 
@@ -72,17 +72,6 @@ class _CockpitScreenState extends State<CockpitScreen>
         _currentDetections = event.detections;
         _currentTelemetry = event.telemetry;
       });
-
-      // Buffer telemetry every 2 seconds before dispatching asynchronously
-      final now = DateTime.now();
-      if (now.difference(_lastSyncDispatch).inSeconds >= 2) {
-        _lastSyncDispatch = now;
-        _syncClient.sendFrameTelemetry(
-          frameId: event.frameId,
-          detections: event.detections,
-          telemetry: event.telemetry,
-        );
-      }
     });
 
     _inferenceWorker.start().catchError((e) {
@@ -131,8 +120,6 @@ class _CockpitScreenState extends State<CockpitScreen>
       }
     }
   }
-
-  int _selectedCameraIndex = 0;
 
   Future<void> _initializeCamera() async {
     try {
@@ -228,24 +215,19 @@ class _CockpitScreenState extends State<CockpitScreen>
     _watchdogTimer = null;
   }
 
+  /// Lock-free single-slot latest-frame gate:
+  /// Never blocks the camera stream, drops frame instantly if isolate is busy or UI is frozen.
   void _handleCameraFrame(CameraImage image) async {
     _diagService.recordFrameReceived();
 
-    final now = DateTime.now();
-    if (now.difference(_lastInferenceTime).inMilliseconds < 250) {
-      return;
-    }
-
-    // Single-Slot Latest-Frame Gate:
-    // Drop frame instantly if worker isolate or engine is currently busy
-    if (_isProcessingFrame || _inferenceWorker.isBusy) {
+    if (_isProcessingFrame || _inferenceWorker.isBusy || _isFrozen) {
       _diagService.recordFrameDropped();
       return;
     }
 
-    _lastInferenceTime = now;
     _isProcessingFrame = true;
     _frameCounter++;
+    final now = DateTime.now();
     final elapsedMs = now.difference(_lastFpsUpdate).inMilliseconds;
     if (elapsedMs >= 500) {
       final currentFps = (_frameCounter * 1000.0) / elapsedMs;
@@ -291,6 +273,7 @@ class _CockpitScreenState extends State<CockpitScreen>
 
         final detections = <DetectionItem>[];
         for (final b in result.boxes) {
+          if (b.confidence < _confThreshold) continue;
           detections.add(DetectionItem(
             x1: b.x1.clamp(0.0, 1.0),
             y1: b.y1.clamp(0.0, 1.0),
@@ -342,14 +325,25 @@ class _CockpitScreenState extends State<CockpitScreen>
     _diagService.setBackend(nextBackend);
   }
 
+  Future<void> _toggleTorch() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    try {
+      final nextTorch = !_isTorchOn;
+      await _cameraController!.setFlashMode(nextTorch ? FlashMode.torch : FlashMode.off);
+      setState(() => _isTorchOn = nextTorch);
+    } catch (_) {}
+  }
+
+  void _toggleFreeze() {
+    setState(() => _isFrozen = !_isFrozen);
+  }
+
   Future<void> _switchCamera() async {
     if (_availableCameras.length < 2) return;
     try {
       _selectedCameraIndex =
           (_selectedCameraIndex + 1) % _availableCameras.length;
       final newCamera = _availableCameras[_selectedCameraIndex];
-      debugPrint(
-          '[CockpitScreen] _switchCamera to index: $_selectedCameraIndex (${newCamera.lensDirection})');
       _stopWatchdog();
       if (_cameraController?.value.isStreamingImages ?? false) {
         await _cameraController?.stopImageStream();
@@ -364,6 +358,7 @@ class _CockpitScreenState extends State<CockpitScreen>
       await controller.initialize();
       if (!mounted) return;
       _cameraController = controller;
+      _isTorchOn = false;
       await _startCameraStream();
       setState(() {});
     } catch (e) {
@@ -378,12 +373,9 @@ class _CockpitScreenState extends State<CockpitScreen>
       builder: (ctx) => EngineSettingsSheet(
         initialConfThreshold: _confThreshold,
         initialIouThreshold: _iouThreshold,
-        initialTelemetrySync: _syncClient.isEnabled,
         isArabic: _isArabic,
         onConfChanged: (val) => setState(() => _confThreshold = val),
         onIouChanged: (val) => setState(() => _iouThreshold = val),
-        onTelemetrySyncChanged: (val) =>
-            setState(() => _syncClient.isEnabled = val),
       ),
     );
   }
@@ -426,7 +418,6 @@ class _CockpitScreenState extends State<CockpitScreen>
     _eventSub?.cancel();
     _cameraController?.dispose();
     _inferenceWorker.stop();
-    _syncClient.close();
     super.dispose();
   }
 
@@ -435,15 +426,40 @@ class _CockpitScreenState extends State<CockpitScreen>
     final size = MediaQuery.of(context).size;
 
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: AppTokens.bg,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. Viewfinder, Loading, Permission Rationale, or Fallback UI
+          // 1. Full-Bleed Camera Preview & 1:1 Co-located HUD CustomPaint (Zero Black Bars)
           if (_isLoadingCamera)
             _buildLoadingState()
           else if (_isCameraInitialized && _cameraController != null)
-            Center(child: CameraPreview(_cameraController!))
+            SizedBox.expand(
+              child: FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  // Swap width & height for upright portrait display
+                  width: _cameraController!.value.previewSize?.height ?? size.width,
+                  height: _cameraController!.value.previewSize?.width ?? size.height,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CameraPreview(_cameraController!),
+                      RepaintBoundary(
+                        child: CustomPaint(
+                          painter: BBoxHudPainter(
+                            detections: _currentDetections,
+                            isArabic: _isArabic,
+                            showTrails: true,
+                            repo: _labelsRepo,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
           else if (_isCameraPermissionDenied)
             _buildPermissionDeniedState()
           else if (_cameraErrorMessage != null)
@@ -451,50 +467,40 @@ class _CockpitScreenState extends State<CockpitScreen>
           else
             _buildFallbackState(),
 
-          // 2. Decoupled 60 FPS CustomPainter HUD inside RepaintBoundary
-          RepaintBoundary(
-            child: CustomPaint(
-              size: size,
-              painter: BBoxHudPainter(
-                detections: _currentDetections,
-                isArabic: _isArabic,
-                showZones: true,
-                showTrails: true,
-                repo: _labelsRepo,
-              ),
-            ),
-          ),
-
-          // 3. Subtle Empty State HUD Watermark ("No objects in scene")
+          // 2. Subtle Watermark when Scene is Empty
           if (_isCameraInitialized &&
               !_isLoadingCamera &&
               _currentDetections.isEmpty &&
               !_watchdogFired)
             Positioned(
-              bottom: 40,
+              bottom: 80,
               left: 20,
               right: 20,
               child: Center(
                 child: Container(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                   decoration: BoxDecoration(
-                    color: Colors.black45,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.white12),
+                    color: AppTokens.surfaceGlass,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: AppTokens.hairline),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const Icon(Icons.radar_rounded,
-                          size: 14, color: Colors.cyanAccent),
-                      const SizedBox(width: 8),
+                          size: 14, color: AppTokens.accent),
+                      const SizedBox(width: 6),
                       Text(
                         _isArabic
-                            ? 'لم يتم رصد أي أهداف في المشهد'
-                            : 'No objects detected in scene',
+                            ? 'بانتظار رصد أهداف في المشهد'
+                            : 'Scanning scene for objects...',
                         style: const TextStyle(
-                            color: Colors.white70, fontSize: 12),
+                          fontFamily: AppTokens.fontCairo,
+                          color: AppTokens.muted,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ],
                   ),
@@ -502,10 +508,10 @@ class _CockpitScreenState extends State<CockpitScreen>
               ),
             ),
 
-          // 4. Watchdog Error Banner (if stalled >= 5s)
+          // 3. Watchdog Error Banner (if stalled >= 5s)
           if (_watchdogFired)
             Positioned(
-              top: MediaQuery.of(context).padding.top + 90,
+              top: MediaQuery.of(context).padding.top + 60,
               left: 16,
               right: 16,
               child: Container(
@@ -513,7 +519,7 @@ class _CockpitScreenState extends State<CockpitScreen>
                 decoration: BoxDecoration(
                   color: const Color(0xFF3B1214),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.redAccent),
+                  border: Border.all(color: AppTokens.danger),
                   boxShadow: const [
                     BoxShadow(color: Colors.black54, blurRadius: 8),
                   ],
@@ -521,8 +527,8 @@ class _CockpitScreenState extends State<CockpitScreen>
                 child: Row(
                   children: [
                     const Icon(Icons.warning_amber_rounded,
-                        color: Colors.redAccent, size: 28),
-                    const SizedBox(width: 12),
+                        color: AppTokens.danger, size: 24),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -530,53 +536,77 @@ class _CockpitScreenState extends State<CockpitScreen>
                         children: [
                           Text(
                             _isArabic
-                                ? 'تنبيه الحارس: توقف تدفق الإطارات'
-                                : 'Watchdog: Frame Stalled (>5s)',
+                                ? 'تنبيه: توقف تدفق الإطارات'
+                                : 'Watchdog: Frame Stream Stalled',
                             style: const TextStyle(
+                              fontFamily: AppTokens.fontCairo,
                               color: Colors.white,
                               fontWeight: FontWeight.bold,
-                              fontSize: 13,
+                              fontSize: 12,
                             ),
                           ),
-                          const SizedBox(height: 2),
                           Text(
                             _isArabic
                                 ? 'لم تتم معالجة أي إطار خلال 5 ثوانٍ.'
                                 : 'No frames processed within 5 seconds.',
                             style: const TextStyle(
-                                color: Colors.white70, fontSize: 11),
+                              fontFamily: AppTokens.fontCairo,
+                              color: Colors.white70,
+                              fontSize: 11,
+                            ),
                           ),
                         ],
                       ),
                     ),
                     TextButton(
                       onPressed: _openDiagnostics,
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.cyanAccent,
+                      child: Text(
+                        _isArabic ? 'التشخيص' : 'Diagnostics',
+                        style: const TextStyle(
+                          fontFamily: AppTokens.fontCairo,
+                          color: AppTokens.accent,
+                          fontSize: 12,
+                        ),
                       ),
-                      child: Text(_isArabic ? 'التشخيص' : 'Diagnostics'),
                     ),
                   ],
                 ),
               ),
             ),
 
-          // 5. Top Glassmorphic Telemetry HUD
+          // 4. Minimal Glassmorphic Top Pill HUD (height <= 48px)
           Positioned(
             top: MediaQuery.of(context).padding.top + 8,
-            left: 12,
-            right: 12,
-            child: TelemetryTopBar(
-              telemetry: _currentTelemetry,
-              detections: _currentDetections,
-              isArabic: _isArabic,
-              onToggleLanguage: _toggleLanguage,
-              onToggleBackend: _toggleBackend,
-              onOpenSampleMode: _openSampleMode,
-              onOpenSettings: _openSettings,
-              onOpenDiagnostics: _openDiagnostics,
-              onSwitchCamera: _switchCamera,
-              repo: _labelsRepo,
+            left: 16,
+            right: 16,
+            child: Center(
+              child: TelemetryTopBar(
+                telemetry: _currentTelemetry,
+                detections: _currentDetections,
+                isArabic: _isArabic,
+                onToggleBackend: _toggleBackend,
+              ),
+            ),
+          ),
+
+          // 5. Minimal Tactical Floating Bottom Dock
+          Positioned(
+            bottom: MediaQuery.of(context).padding.bottom + 12,
+            left: 16,
+            right: 16,
+            child: Center(
+              child: CockpitBottomDock(
+                isArabic: _isArabic,
+                isTorchOn: _isTorchOn,
+                isFrozen: _isFrozen,
+                onToggleLanguage: _toggleLanguage,
+                onOpenSampleMode: _openSampleMode,
+                onToggleTorch: _toggleTorch,
+                onToggleFreeze: _toggleFreeze,
+                onOpenSettings: _openSettings,
+                onOpenDiagnostics: _openDiagnostics,
+                onSwitchCamera: _switchCamera,
+              ),
             ),
           ),
         ],
@@ -586,18 +616,22 @@ class _CockpitScreenState extends State<CockpitScreen>
 
   Widget _buildLoadingState() {
     return Container(
-      color: const Color(0xFF0D0D11),
+      color: AppTokens.bg,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const CircularProgressIndicator(color: Colors.cyanAccent),
+            const CircularProgressIndicator(color: AppTokens.accent),
             const SizedBox(height: 16),
             Text(
               _isArabic
-                  ? 'جاري تشغيل الكاميرا ومحرك NCNN...'
+                  ? 'جاري تهيئة الكاميرا ومحرك NCNN...'
                   : 'Initializing Camera & NCNN Engine...',
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
+              style: const TextStyle(
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.muted,
+                fontSize: 13,
+              ),
             ),
           ],
         ),
@@ -607,33 +641,39 @@ class _CockpitScreenState extends State<CockpitScreen>
 
   Widget _buildPermissionDeniedState() {
     return Container(
-      color: const Color(0xFF16161D),
+      color: AppTokens.surface,
       padding: const EdgeInsets.all(24),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.videocam_off_outlined,
-                size: 64, color: Colors.amberAccent),
+                size: 56, color: AppTokens.warn),
             const SizedBox(height: 16),
             Text(
               _isArabic
                   ? 'إذن استخدام الكاميرا مطلوب'
                   : 'Camera Permission Required',
               style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold),
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.text,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
             ),
             const SizedBox(height: 8),
             Text(
               _isArabic
-                  ? 'يحتاج التطبيق لإذن الكاميرا لتشغيل الكشف المباشر عن الأهداف. يمكنك منح الإذن أو استخدام وضع الصور المرجعية.'
-                  : 'Camera access is required for live real-time detection. You can grant access or run offline sample benchmark mode.',
+                  ? 'يحتاج التطبيق لإذن الكاميرا لتشغيل الكشف المباشر عن الأهداف.'
+                  : 'Camera access is required for live real-time detection.',
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
+              style: const TextStyle(
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.muted,
+                fontSize: 12,
+              ),
             ),
-            const SizedBox(height: 24),
+            const SizedBox(height: 20),
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
@@ -647,25 +687,27 @@ class _CockpitScreenState extends State<CockpitScreen>
                       await CameraPermissionService.openAppSettings();
                     }
                   },
-                  icon: const Icon(Icons.security_rounded, size: 18),
+                  icon: const Icon(Icons.security_rounded, size: 16),
                   label: Text(
-                    _isArabic ? 'منح الإذن / الإعدادات' : 'Grant / Settings',
+                    _isArabic ? 'منح الإذن' : 'Grant Permission',
+                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
                   ),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.cyanAccent,
+                    backgroundColor: AppTokens.accent,
                     foregroundColor: Colors.black,
                   ),
                 ),
                 const SizedBox(width: 12),
                 OutlinedButton.icon(
                   onPressed: _openSampleMode,
-                  icon: const Icon(Icons.photo_library_outlined, size: 18),
+                  icon: const Icon(Icons.photo_library_outlined, size: 16),
                   label: Text(
                     _isArabic ? 'وضع الصور' : 'Sample Mode',
+                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
                   ),
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.cyanAccent,
-                    side: const BorderSide(color: Colors.cyanAccent),
+                    foregroundColor: AppTokens.accent,
+                    side: const BorderSide(color: AppTokens.accent),
                   ),
                 ),
               ],
@@ -678,27 +720,33 @@ class _CockpitScreenState extends State<CockpitScreen>
 
   Widget _buildErrorState(String message) {
     return Container(
-      color: const Color(0xFF161214),
+      color: AppTokens.bg,
       padding: const EdgeInsets.all(24),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.error_outline_rounded,
-                size: 56, color: Colors.redAccent),
+                size: 56, color: AppTokens.danger),
             const SizedBox(height: 16),
             Text(
               _isArabic ? 'خطأ في تشغيل الكاميرا' : 'Camera Hardware Error',
               style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold),
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.text,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
             ),
             const SizedBox(height: 8),
             Text(
               message,
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white60, fontSize: 12),
+              style: const TextStyle(
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.muted,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 20),
             Row(
@@ -707,9 +755,12 @@ class _CockpitScreenState extends State<CockpitScreen>
                 ElevatedButton.icon(
                   onPressed: _requestPermissionAndInitCamera,
                   icon: const Icon(Icons.refresh_rounded, size: 16),
-                  label: Text(_isArabic ? 'إعادة المحاولة' : 'Retry'),
+                  label: Text(
+                    _isArabic ? 'إعادة المحاولة' : 'Retry',
+                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
+                  ),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.cyanAccent,
+                    backgroundColor: AppTokens.accent,
                     foregroundColor: Colors.black,
                   ),
                 ),
@@ -717,10 +768,13 @@ class _CockpitScreenState extends State<CockpitScreen>
                 OutlinedButton.icon(
                   onPressed: _openDiagnostics,
                   icon: const Icon(Icons.analytics_outlined, size: 16),
-                  label: Text(_isArabic ? 'التشخيص' : 'Diagnostics'),
+                  label: Text(
+                    _isArabic ? 'التشخيص' : 'Diagnostics',
+                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
+                  ),
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.cyanAccent,
-                    side: const BorderSide(color: Colors.cyanAccent),
+                    foregroundColor: AppTokens.accent,
+                    side: const BorderSide(color: AppTokens.accent),
                   ),
                 ),
               ],
@@ -733,22 +787,26 @@ class _CockpitScreenState extends State<CockpitScreen>
 
   Widget _buildFallbackState() {
     return Container(
-      color: const Color(0xFF0D0D11),
+      color: AppTokens.bg,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
               Icons.camera_alt_outlined,
-              size: 64,
-              color: Colors.white.withValues(alpha: 0.2),
+              size: 56,
+              color: AppTokens.muted.withValues(alpha: 0.3),
             ),
             const SizedBox(height: 12),
             Text(
               _isArabic
                   ? 'بانتظار مستشعر الكاميرا أو وضع الصور المرجعية'
-                  : 'Awaiting Camera Stream or Sample Benchmark Mode',
-              style: const TextStyle(color: Colors.white54, fontSize: 13),
+                  : 'Awaiting Camera Stream or Sample Benchmark',
+              style: const TextStyle(
+                fontFamily: AppTokens.fontCairo,
+                color: AppTokens.muted,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 16),
             OutlinedButton.icon(
@@ -756,11 +814,14 @@ class _CockpitScreenState extends State<CockpitScreen>
               icon: const Icon(Icons.photo_library_outlined, size: 16),
               label: Text(
                 _isArabic ? 'فتح وضع الصور المرجعية' : 'Launch Sample Benchmark',
-                style: const TextStyle(fontSize: 12),
+                style: const TextStyle(
+                  fontFamily: AppTokens.fontCairo,
+                  fontSize: 12,
+                ),
               ),
               style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.cyanAccent,
-                side: const BorderSide(color: Colors.cyanAccent),
+                foregroundColor: AppTokens.accent,
+                side: const BorderSide(color: AppTokens.accent),
               ),
             ),
           ],

@@ -21,6 +21,7 @@
 // Tencent NCNN headers
 #include "net.h"
 #include "mat.h"
+#include "cpu.h"
 #if NCNN_VULKAN
 #include "gpu.h"
 #endif
@@ -159,9 +160,13 @@ int yolo_engine_init(const char* param_path, const char* bin_path, int use_vulka
     parse_param_blob_names(param_path, g_ctx.in_blob_name, g_ctx.out_blob_name);
     LOGI("yolo_engine_init: in_blob=%s, out_blob=%s", g_ctx.in_blob_name.c_str(), g_ctx.out_blob_name.c_str());
 
+    ncnn::set_cpu_powersave(2);
+
     g_ctx.net.clear();
     g_ctx.net.opt = ncnn::Option();
-    g_ctx.net.opt.num_threads = 1;
+    g_ctx.net.opt.lightmode = true;
+    g_ctx.net.opt.num_threads = 4;
+    g_ctx.net.opt.use_packing_layout = true;
     g_ctx.net.opt.use_fp16_packed = true;
     g_ctx.net.opt.use_fp16_storage = true;
     g_ctx.net.opt.use_fp16_arithmetic = true;
@@ -237,7 +242,9 @@ int yolo_engine_set_backend(int use_vulkan) {
         LOGI("yolo_engine_set_backend: Reloading net with Vulkan GPU...");
         g_ctx.net.clear();
         g_ctx.net.opt = ncnn::Option();
-        g_ctx.net.opt.num_threads = 1;
+        g_ctx.net.opt.lightmode = true;
+        g_ctx.net.opt.num_threads = 4;
+        g_ctx.net.opt.use_packing_layout = true;
         g_ctx.net.opt.use_fp16_packed = true;
         g_ctx.net.opt.use_fp16_storage = true;
         g_ctx.net.opt.use_fp16_arithmetic = true;
@@ -249,7 +256,15 @@ int yolo_engine_set_backend(int use_vulkan) {
         int rb = g_ctx.net.load_model(g_ctx.bin_path.c_str());
         if (rp != 0 || rb != 0) {
             LOGE("yolo_engine_set_backend: Vulkan reload failed (rp=%d, rb=%d), falling back to CPU", rp, rb);
+            ncnn::set_cpu_powersave(2);
             g_ctx.net.clear();
+            g_ctx.net.opt = ncnn::Option();
+            g_ctx.net.opt.lightmode = true;
+            g_ctx.net.opt.num_threads = 4;
+            g_ctx.net.opt.use_packing_layout = true;
+            g_ctx.net.opt.use_fp16_packed = true;
+            g_ctx.net.opt.use_fp16_storage = true;
+            g_ctx.net.opt.use_fp16_arithmetic = true;
             g_ctx.net.opt.use_vulkan_compute = false;
             g_ctx.active_backend = 0;
             g_ctx.net.load_param(g_ctx.param_path.c_str());
@@ -258,10 +273,13 @@ int yolo_engine_set_backend(int use_vulkan) {
             LOGI("yolo_engine_set_backend: Vulkan backend active");
         }
     } else {
-        LOGI("yolo_engine_set_backend: Reloading net with CPU...");
+        LOGI("yolo_engine_set_backend: Reloading net with CPU (4 threads, big cores)...");
+        ncnn::set_cpu_powersave(2);
         g_ctx.net.clear();
         g_ctx.net.opt = ncnn::Option();
-        g_ctx.net.opt.num_threads = 1;
+        g_ctx.net.opt.lightmode = true;
+        g_ctx.net.opt.num_threads = 4;
+        g_ctx.net.opt.use_packing_layout = true;
         g_ctx.net.opt.use_fp16_packed = true;
         g_ctx.net.opt.use_fp16_storage = true;
         g_ctx.net.opt.use_fp16_arithmetic = true;
@@ -297,41 +315,63 @@ int yolo_engine_forward_yuv420(
 
     std::lock_guard<std::mutex> lock(g_engine_mutex);
 
-    uint8_t min_y = 255, max_y = 0;
-    for (int i = 0; i < std::min(1000, width * height); ++i) {
-        if (y_plane[i] < min_y) min_y = y_plane[i];
-        if (y_plane[i] > max_y) max_y = y_plane[i];
-    }
-    LOGE("y_plane check: w=%d, h=%d, min_y=%d, max_y=%d", width, height, min_y, max_y);
-
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // 1. Calculate letterbox scale and paddings for 640x640 target
+    // 1. Determine upright frame dimensions based on sensor_orientation
+    int rot_w = width;
+    int rot_h = height;
+    if (sensor_orientation == 90 || sensor_orientation == 270) {
+        rot_w = height;
+        rot_h = width;
+    }
+
+    // 2. Calculate letterbox scale and paddings for 640x640 target based on upright dimensions
     int target_w = 640;
     int target_h = 640;
-    float scale = std::min((float)target_w / (float)width, (float)target_h / (float)height);
-    int scaled_w = (int)(width * scale);
-    int scaled_h = (int)(height * scale);
+    float scale = std::min((float)target_w / (float)rot_w, (float)target_h / (float)rot_h);
+    int scaled_w = (int)(rot_w * scale);
+    int scaled_h = (int)(rot_h * scale);
     int pad_w = (target_w - scaled_w) / 2;
     int pad_h = (target_h - scaled_h) / 2;
 
     // Fill letterbox canvas with 114 gray background (zero heap allocation)
     memset(g_ctx.rgb_letterbox_buf, 114, target_w * target_h * 3);
 
-    // 2. Direct YUV420 to RGB with nearest/bilinear scaling into letterbox center
+    // 3. Direct YUV420 to RGB with sensor rotation and scaling into letterbox center
     // Handles both I420 (uv_pixel_stride=1) and NV21 (uv_pixel_stride=2, v before u)
     for (int dy = 0; dy < scaled_h; ++dy) {
-        int sy = (int)(dy / scale);
-        if (sy >= height) sy = height - 1;
-        const uint8_t* y_row = y_plane + sy * y_row_stride;
-        const uint8_t* u_row = u_plane + (sy / 2) * uv_row_stride;
-        const uint8_t* v_row = v_plane + (sy / 2) * uv_row_stride;
+        int ry = (int)(dy / scale);
+        if (ry >= rot_h) ry = rot_h - 1;
 
         uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * target_w + pad_w) * 3;
 
         for (int dx = 0; dx < scaled_w; ++dx) {
-            int sx = (int)(dx / scale);
+            int rx = (int)(dx / scale);
+            if (rx >= rot_w) rx = rot_w - 1;
+
+            int sx = rx;
+            int sy = ry;
+            if (sensor_orientation == 90) {
+                // 90° clockwise: sx = ry, sy = height - 1 - rx
+                sx = ry;
+                sy = height - 1 - rx;
+            } else if (sensor_orientation == 270) {
+                // 270° clockwise: sx = width - 1 - ry, sy = rx
+                sx = width - 1 - ry;
+                sy = rx;
+            } else if (sensor_orientation == 180) {
+                sx = width - 1 - rx;
+                sy = height - 1 - ry;
+            }
+
+            if (sx < 0) sx = 0;
             if (sx >= width) sx = width - 1;
+            if (sy < 0) sy = 0;
+            if (sy >= height) sy = height - 1;
+
+            const uint8_t* y_row = y_plane + sy * y_row_stride;
+            const uint8_t* u_row = u_plane + (sy / 2) * uv_row_stride;
+            const uint8_t* v_row = v_plane + (sy / 2) * uv_row_stride;
 
             uint8_t y = y_row[sx];
             uint8_t u = u_row[(sx / 2) * uv_pixel_stride];
@@ -374,20 +414,7 @@ int yolo_engine_forward_yuv420(
     }
 
     // Copy raw output tensor [84, 8400] to pre-allocated float buffer
-    // out_mat: w=8400, h=84
     memcpy(g_ctx.raw_output_tensor, (const float*)out_mat.data, 84 * 8400 * sizeof(float));
-
-    float max_a = 0.0f, max_b = 0.0f;
-    for (int a = 0; a < 8400; ++a) {
-        for (int c = 0; c < 80; ++c) {
-            float sa = g_ctx.raw_output_tensor[(4 + c) * 8400 + a];
-            if (sa > max_a) max_a = sa;
-            float sb = g_ctx.raw_output_tensor[a * 84 + (4 + c)];
-            if (sb > max_b) max_b = sb;
-        }
-    }
-    LOGE("out_mat: dims=%d, w=%d, h=%d, c=%d, cstep=%d, max_a=%f, max_b=%f",
-         out_mat.dims, out_mat.w, out_mat.h, out_mat.c, (int)out_mat.cstep, max_a, max_b);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     float inference_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
@@ -431,28 +458,54 @@ int yolo_engine_forward_rgba(
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
+    int rot_w = width;
+    int rot_h = height;
+    if (sensor_orientation == 90 || sensor_orientation == 270) {
+        rot_w = height;
+        rot_h = width;
+    }
+
     int target_w = 640;
     int target_h = 640;
-    float scale = std::min((float)target_w / (float)width, (float)target_h / (float)height);
-    int scaled_w = (int)(width * scale);
-    int scaled_h = (int)(height * scale);
+    float scale = std::min((float)target_w / (float)rot_w, (float)target_h / (float)rot_h);
+    int scaled_w = (int)(rot_w * scale);
+    int scaled_h = (int)(rot_h * scale);
     int pad_w = (target_w - scaled_w) / 2;
     int pad_h = (target_h - scaled_h) / 2;
 
     memset(g_ctx.rgb_letterbox_buf, 114, target_w * target_h * 3);
 
     for (int dy = 0; dy < scaled_h; ++dy) {
-        int sy = (int)(dy / scale);
-        if (sy >= height) sy = height - 1;
-        const uint8_t* src_row = rgba + sy * width * 4;
+        int ry = (int)(dy / scale);
+        if (ry >= rot_h) ry = rot_h - 1;
         uint8_t* dst_row = g_ctx.rgb_letterbox_buf + ((pad_h + dy) * target_w + pad_w) * 3;
 
         for (int dx = 0; dx < scaled_w; ++dx) {
-            int sx = (int)(dx / scale);
+            int rx = (int)(dx / scale);
+            if (rx >= rot_w) rx = rot_w - 1;
+
+            int sx = rx;
+            int sy = ry;
+            if (sensor_orientation == 90) {
+                sx = ry;
+                sy = height - 1 - rx;
+            } else if (sensor_orientation == 270) {
+                sx = width - 1 - ry;
+                sy = rx;
+            } else if (sensor_orientation == 180) {
+                sx = width - 1 - rx;
+                sy = height - 1 - ry;
+            }
+
+            if (sx < 0) sx = 0;
             if (sx >= width) sx = width - 1;
-            dst_row[dx * 3]     = src_row[sx * 4];     // R
-            dst_row[dx * 3 + 1] = src_row[sx * 4 + 1]; // G
-            dst_row[dx * 3 + 2] = src_row[sx * 4 + 2]; // B
+            if (sy < 0) sy = 0;
+            if (sy >= height) sy = height - 1;
+
+            const uint8_t* src_pixel = rgba + (sy * width + sx) * 4;
+            dst_row[dx * 3]     = src_pixel[0];     // R
+            dst_row[dx * 3 + 1] = src_pixel[1];     // G
+            dst_row[dx * 3 + 2] = src_pixel[2];     // B
         }
     }
 
@@ -469,7 +522,15 @@ int yolo_engine_forward_rgba(
 #if NCNN_VULKAN
         if (g_ctx.active_backend == 1) {
             LOGE("NCNN extract failed on Vulkan (%d), falling back to CPU", ret);
+            ncnn::set_cpu_powersave(2);
             g_ctx.net.clear();
+            g_ctx.net.opt = ncnn::Option();
+            g_ctx.net.opt.lightmode = true;
+            g_ctx.net.opt.num_threads = 4;
+            g_ctx.net.opt.use_packing_layout = true;
+            g_ctx.net.opt.use_fp16_packed = true;
+            g_ctx.net.opt.use_fp16_storage = true;
+            g_ctx.net.opt.use_fp16_arithmetic = true;
             g_ctx.net.opt.use_vulkan_compute = false;
             g_ctx.active_backend = 0;
             g_ctx.net.load_param(g_ctx.param_path.c_str());
@@ -487,18 +548,6 @@ int yolo_engine_forward_rgba(
     }
 
     memcpy(g_ctx.raw_output_tensor, (const float*)out_mat.data, 84 * 8400 * sizeof(float));
-
-    float max_a = 0.0f, max_b = 0.0f;
-    for (int a = 0; a < 8400; ++a) {
-        for (int c = 0; c < 80; ++c) {
-            float sa = g_ctx.raw_output_tensor[(4 + c) * 8400 + a];
-            if (sa > max_a) max_a = sa;
-            float sb = g_ctx.raw_output_tensor[a * 84 + (4 + c)];
-            if (sb > max_b) max_b = sb;
-        }
-    }
-    LOGE("out_mat: dims=%d, w=%d, h=%d, c=%d, cstep=%d, max_a=%f, max_b=%f",
-         out_mat.dims, out_mat.w, out_mat.h, out_mat.c, (int)out_mat.cstep, max_a, max_b);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     float inference_ms = std::chrono::duration<float, std::milli>(t1 - t0).count();

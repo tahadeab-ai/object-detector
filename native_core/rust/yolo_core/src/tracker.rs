@@ -7,7 +7,7 @@ use crate::types::{
 };
 
 pub const MAX_TRACKS: usize = 100;
-pub const MIN_HITS_CONFIRM: u32 = 3;
+pub const MIN_HITS_CONFIRM: u32 = 2;
 pub const MAX_AGE_COASTING: u32 = 30; // Survives 30 frames, deleted on frame 31
 pub const EMA_ALPHA: f32 = 0.65;
 pub const VELOCITY_ALPHA: f32 = 0.70;
@@ -168,6 +168,10 @@ impl Track {
         // State transition: CONFIRMED -> COASTING on first miss
         if self.state == TRACK_CONFIRMED {
             self.state = TRACK_COASTING;
+        } else if self.state == TRACK_TENTATIVE {
+            // Unconfirmed tentative tracks that miss are spurious; delete immediately
+            self.state = TRACK_DELETED;
+            self.active = false;
         }
 
         // DELETED when time_since_update > MAX_AGE_COASTING (frame 31)
@@ -360,10 +364,14 @@ impl TwoStageTracker {
             }
         }
 
-        // Collect confirmed and active tentative tracks for output
+        // Collect CONFIRMED tracks for output (active targets verified with at least 2 hits)
         let mut out_count = 0;
         for track in self.tracks.iter() {
-            if track.active && (track.state == TRACK_CONFIRMED || track.state == TRACK_COASTING || track.state == TRACK_TENTATIVE) {
+            if track.active
+                && track.state == TRACK_CONFIRMED
+                && track.hits >= 2
+                && track.confidence >= self.conf_threshold
+            {
                 out_boxes[out_count] = track.to_detection_box();
                 out_count += 1;
                 if out_count >= out_boxes.len() {

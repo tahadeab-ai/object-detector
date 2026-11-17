@@ -24,7 +24,7 @@ pub extern "C" fn yolo_rust_init() -> i32 {
         Ok(guard) => guard,
         Err(_) => return -1,
     };
-    *lock = Some(TwoStageTracker::new(0.25));
+    *lock = Some(TwoStageTracker::new(0.45));
     0
 }
 
@@ -78,17 +78,17 @@ pub extern "C" fn yolo_rust_process_frame(
     let mut decoded_boxes = [YoloDetectionBox::default(); YOLO_MAX_BOXES];
     let mut nms_boxes = [YoloDetectionBox::default(); YOLO_MAX_BOXES];
 
-    // 1. Decode raw tensor [84, 8400]
+    // 1. Decode raw tensor [84, 8400] with strict 0.45 confidence gate
     let decoded_count = decode_tensor(
         tensor_slice,
         scale,
         pad_w,
         pad_h,
-        0.10, // low-conf threshold so Stage 2 can use 0.10 <= conf < 0.25 candidates
+        0.45,
         &mut decoded_boxes,
     );
 
-    // 2. Class-aware NMS
+    // 2. Class-aware NMS with 0.45 IoU threshold
     let nms_count = class_aware_nms(
         &decoded_boxes[..decoded_count],
         0.45,

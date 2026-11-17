@@ -67,6 +67,8 @@ class CocoLabelsRepository {
     return isArabic ? info.nameAr : info.nameEn;
   }
 
+  String getCategory(int classId) => _classes[classId]?.category ?? 'general';
+
   CocoClassInfo? getInfo(int classId) => _classes[classId];
 
   List<CocoClassInfo> getAllClasses() => _classes.values.toList();

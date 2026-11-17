@@ -44,17 +44,11 @@ The system combines **Tencent NCNN** (ARM NEON & Vulkan Compute GPU acceleration
                                           ▼
 +-----------------------------------------------------------------------------------+
 |                           Flutter UI Thread (Main)                                |
-|   - Decoupled CustomPainter HUD at target 60 FPS                                  |
-|   - Live glassmorphic telemetry bar (FPS, Pre/NCNN/Track latencies, chip toggle)   |
+|   - Decoupled CustomPainter HUD at target 60 FPS (zero allocation in paint loop)  |
+|   - Glassmorphic telemetry top pill (FPS, NCNN ms, Objects, NEON 4T/Vulkan toggle)|
+|   - Floating tactical bottom dock (AR/EN, Benchmark, Torch, Freeze, Settings)     |
 |   - Dynamic bilingual switching (English LTR <-> Arabic RTL, 80 COCO classes)     |
 |   - Offline Sample Benchmark Mode (bundled real photos)                           |
-+-----------------------------------------------------------------------------------+
-                                          │  Asynchronous (1500ms timeout)
-                                          ▼
-+-----------------------------------------------------------------------------------+
-|                    Optional Go + Redis Microservice (Docker)                      |
-|   - Go 1.22+ Fiber REST & WebSocket streaming                                     |
-|   - Redis 7 Streams (yolo:telemetry) & Sorted Sets (yolo:class_counts)            |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -62,16 +56,17 @@ The system combines **Tencent NCNN** (ARM NEON & Vulkan Compute GPU acceleration
 
 ## 2. Key Features
 
-- **Snapdragon 855 Hardware-Targeted**: Optimized specifically for Qualcomm Snapdragon 855 (`SM8150`, Samsung Galaxy Note 10 `SM-N970U`). Realistic inference targets at $640 \times 640$ FP16:
-  - **CPU (ARM NEON 4 Big Cores)**: $\ge 12$ FPS
-  - **GPU (Vulkan Compute)**: $\ge 20$ FPS
+- **Snapdragon 855 Hardware-Targeted**: Optimized specifically for Qualcomm Snapdragon 855 (`SM8150`, Samsung Galaxy Note 10 `SM-N970U`). 100% On-Device Edge AI execution:
+  - **CPU (ARM NEON 4 Big Cores with `ncnn::set_cpu_powersave(2)`)**: $\ge 20$ FPS (35-45ms inference)
+  - **GPU (Vulkan Compute)**: $\ge 25$ FPS
 - **Decoupled 60 FPS UI**: Bounding box rendering runs decoupled from neural network inference via exponential moving average (EMA) interpolation.
 - **Robust Multi-Object Tracking Engine**:
-  - Full 4-state lifecycle: `TENTATIVE` (requires 3 consecutive hits) $\to$ `CONFIRMED` $\to$ `COASTING` (retained up to 30 frames) $\to$ `DELETED` (frame 31).
+  - Full 4-state lifecycle: `TENTATIVE` (requires 2 consecutive hits) $\to$ `CONFIRMED` $\to$ `COASTING` (retained up to 30 frames) $\to$ `DELETED` (frame 31).
   - Two-stage association: high-confidence detections first, followed by low-confidence re-linking of coasting tracks to eliminate ID switches on crossing trajectories.
   - Zero dynamic heap allocation per frame (fixed-capacity buffers: max 100 tracks, 100 candidates).
 - **Strict Scope Lock**: Standalone, general-purpose computer vision platform. Visually-impaired / assistive audio features are strictly excluded.
-- **Bilingual Arabic/English**: Complete 80 COCO classes mapped to high-quality Modern Standard Arabic and English with seamless runtime switching.
+- **Bilingual Arabic/English**: Complete 80 COCO classes mapped to high-quality Modern Standard Arabic and English with Cairo typography and seamless runtime switching.
+- **Zero Cloud / Backend Dependency**: Completely private, self-contained on-device pipeline with zero network telemetry or tracking.
 
 ---
 
@@ -149,23 +144,23 @@ C:\dev\object-detector/
 │       │   │   └── engine_telemetry.dart      # FPS and latency metrics
 │       │   ├── l10n/
 │       │   │   └── coco_labels_repository.dart# Bilingual class lookup repository
+│       │   ├── theme/
+│       │   │   └── design_tokens.dart         # Dark tactical cockpit tokens & Cairo typography
 │       │   └── services/
+│       │       ├── camera_permission_service.dart # Runtime Android CAMERA permission handler
 │       │       ├── detection_event_bus.dart   # Neutral broadcast stream
-│       │       └── telemetry_sync_client.dart # Non-blocking sync client for Go/Redis
+│       │       ├── diagnostics_service.dart   # SHA256, FPS telemetry, JSON clipboard export
+│       │       └── inference_worker.dart      # Lock-free background isolate runner
 │       └── features/
 │           ├── cockpit/
-│           │   ├── cockpit_screen.dart        # Main camera + HUD screen
-│           │   ├── bbox_hud_painter.dart      # 60 FPS CustomPainter HUD
-│           │   └── telemetry_top_bar.dart     # Glassmorphic latency & FPS telemetry bar
+│           │   ├── cockpit_screen.dart        # Full-bleed camera + 1:1 aligned HUD screen
+│           │   ├── bbox_hud_painter.dart      # 60 FPS CustomPainter with corner brackets
+│           │   ├── telemetry_top_bar.dart     # Minimal glassmorphic top pill HUD (<=48px)
+│           │   └── cockpit_bottom_dock.dart   # Floating tactical bottom action dock
 │           ├── sample_mode/
 │           │   └── sample_benchmark_view.dart # Static image benchmark runner
 │           └── settings/
-│               └── engine_settings_sheet.dart # Threshold sliders & category filters
-└── backend_go_redis/
-    ├── docker-compose.yml                     # Redis 7 Alpine + Go telemetry service
-    ├── Dockerfile
-    ├── go.mod
-    └── main.go                                # Go Fiber + WebSocket ingestion & Redis stream
+│               └── engine_settings_sheet.dart # Threshold sliders & Balanced/Sensitive presets
 ```
 
 ---
