@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
@@ -6,14 +5,11 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'native_structs.dart';
 
-// Native function typedefs
+// Native function typedefs for Legacy Detection Engine API
 typedef _YoloEngineInitC = Int32 Function(
     Pointer<Utf8> paramPath, Pointer<Utf8> binPath, Int32 useVulkan);
 typedef _YoloEngineInitDart = int Function(
     Pointer<Utf8> paramPath, Pointer<Utf8> binPath, int useVulkan);
-
-typedef _YoloEngineSetBackendC = Int32 Function(Int32 useVulkan);
-typedef _YoloEngineSetBackendDart = int Function(int useVulkan);
 
 typedef _YoloEngineForwardYuv420C = Int32 Function(
     Pointer<Uint8> yPlane,
@@ -51,8 +47,64 @@ typedef _YoloEngineForwardRgbaDart = int Function(
     int sensorOrientation,
     Pointer<YoloFrameResult> outResult);
 
-typedef _YoloEngineDestroyC = Void Function();
-typedef _YoloEngineDestroyDart = void Function();
+// Native function typedefs for Modern Multi-Task Engine API
+typedef _YoloMultiTaskInitC = Int32 Function(
+    Int32 taskId,
+    Pointer<Utf8> paramPath,
+    Pointer<Utf8> binPath,
+    Int32 targetSize,
+    Int32 useBackend);
+typedef _YoloMultiTaskInitDart = int Function(
+    int taskId,
+    Pointer<Utf8> paramPath,
+    Pointer<Utf8> binPath,
+    int targetSize,
+    int useBackend);
+
+typedef _YoloMultiTaskSetSizeC = Int32 Function(Int32 targetSize);
+typedef _YoloMultiTaskSetSizeDart = int Function(int targetSize);
+
+typedef _YoloMultiTaskSetBackendC = Int32 Function(Int32 backend);
+typedef _YoloMultiTaskSetBackendDart = int Function(int backend);
+
+typedef _YoloMultiTaskForwardYuv420C = Int32 Function(
+    Pointer<Uint8> yPlane,
+    Pointer<Uint8> uPlane,
+    Pointer<Uint8> vPlane,
+    Int32 width,
+    Int32 height,
+    Int32 yRowStride,
+    Int32 uvRowStride,
+    Int32 uvPixelStride,
+    Int32 sensorOrientation,
+    Pointer<Void> outResultBuffer);
+typedef _YoloMultiTaskForwardYuv420Dart = int Function(
+    Pointer<Uint8> yPlane,
+    Pointer<Uint8> uPlane,
+    Pointer<Uint8> vPlane,
+    int width,
+    int height,
+    int yRowStride,
+    int uvRowStride,
+    int uvPixelStride,
+    int sensorOrientation,
+    Pointer<Void> outResultBuffer);
+
+typedef _YoloMultiTaskForwardRgbaC = Int32 Function(
+    Pointer<Uint8> rgba,
+    Int32 width,
+    Int32 height,
+    Int32 sensorOrientation,
+    Pointer<Void> outResultBuffer);
+typedef _YoloMultiTaskForwardRgbaDart = int Function(
+    Pointer<Uint8> rgba,
+    int width,
+    int height,
+    int sensorOrientation,
+    Pointer<Void> outResultBuffer);
+
+typedef _YoloMultiTaskDestroyC = Void Function();
+typedef _YoloMultiTaskDestroyDart = void Function();
 
 /// Distinct error codes for fast failure
 class YoloEngineErrors {
@@ -66,146 +118,206 @@ class YoloEngineErrors {
 /// Zero-allocation, high-performance Dart FFI wrapper around `libyolo_ncnn.so`
 class YoloNcnnEngine {
   static YoloNcnnEngine? _instance;
-  late final DynamicLibrary _lib;
+  final DynamicLibrary _lib;
 
+  // Legacy detection functions
   late final _YoloEngineInitDart _init;
-  late final _YoloEngineSetBackendDart _setBackend;
   late final _YoloEngineForwardYuv420Dart _forwardYuv420;
   late final _YoloEngineForwardRgbaDart _forwardRgba;
-  late final _YoloEngineDestroyDart _destroy;
 
-  // Persistent native frame result buffer (Allocated ONCE, zero heap allocation per frame)
+  // Modern Multi-task functions
+  late final _YoloMultiTaskInitDart _multiTaskInit;
+  late final _YoloMultiTaskSetSizeDart _multiTaskSetSize;
+  late final _YoloMultiTaskSetBackendDart _multiTaskSetBackend;
+  late final _YoloMultiTaskForwardYuv420Dart _multiTaskForwardYuv420;
+  late final _YoloMultiTaskForwardRgbaDart _multiTaskForwardRgba;
+  late final _YoloMultiTaskDestroyDart _multiTaskDestroy;
+
+  // Persistent native buffers (Allocated ONCE, zero heap allocation per frame)
   late final Pointer<YoloFrameResult> _persistentFrameResult;
-  // Persistent output tensor buffer for 84 * 8400 floats = 705,600 floats (2,822,400 bytes)
+  late final Pointer<YoloSegmentationResult> _persistentSegResult;
+  late final Pointer<YoloPoseResult> _persistentPoseResult;
+  late final Pointer<YoloClassificationResult> _persistentClsResult;
+  late final Pointer<YoloObbResult> _persistentObbResult;
   late final Pointer<Float> _persistentOutputTensor;
 
   bool _isInitialized = false;
   bool get isInitialized => _isInitialized;
+  VisionTask _activeTask = VisionTask.detection;
+  VisionTask get activeTask => _activeTask;
 
   Pointer<YoloFrameResult> get persistentResultBuffer => _persistentFrameResult;
+  Pointer<YoloSegmentationResult> get persistentSegBuffer => _persistentSegResult;
+  Pointer<YoloPoseResult> get persistentPoseBuffer => _persistentPoseResult;
+  Pointer<YoloClassificationResult> get persistentClsBuffer => _persistentClsResult;
+  Pointer<YoloObbResult> get persistentObbBuffer => _persistentObbResult;
   Pointer<Float> get persistentTensorBuffer => _persistentOutputTensor;
 
   YoloNcnnEngine._(DynamicLibrary lib) : _lib = lib {
     enforceLayoutGate();
 
-    _init = _lib.lookupFunction<_YoloEngineInitC, _YoloEngineInitDart>(
-        'yolo_engine_init');
-    _setBackend =
-        _lib.lookupFunction<_YoloEngineSetBackendC, _YoloEngineSetBackendDart>(
-            'yolo_engine_set_backend');
-    _forwardYuv420 = _lib.lookupFunction<_YoloEngineForwardYuv420C,
-        _YoloEngineForwardYuv420Dart>('yolo_engine_forward_yuv420');
-    _forwardRgba = _lib.lookupFunction<_YoloEngineForwardRgbaC,
-        _YoloEngineForwardRgbaDart>('yolo_engine_forward_rgba');
-    _destroy = _lib.lookupFunction<_YoloEngineDestroyC, _YoloEngineDestroyDart>(
-        'yolo_engine_destroy');
+    // Lookup Legacy symbols
+    _init = _lib.lookupFunction<_YoloEngineInitC, _YoloEngineInitDart>('yolo_engine_init');
+    _forwardYuv420 = _lib.lookupFunction<_YoloEngineForwardYuv420C, _YoloEngineForwardYuv420Dart>('yolo_engine_forward_yuv420');
+    _forwardRgba = _lib.lookupFunction<_YoloEngineForwardRgbaC, _YoloEngineForwardRgbaDart>('yolo_engine_forward_rgba');
+
+    // Lookup Multi-task symbols
+    _multiTaskInit = _lib.lookupFunction<_YoloMultiTaskInitC, _YoloMultiTaskInitDart>('yolo_multitask_init');
+    _multiTaskSetSize = _lib.lookupFunction<_YoloMultiTaskSetSizeC, _YoloMultiTaskSetSizeDart>('yolo_multitask_set_target_size');
+    _multiTaskSetBackend = _lib.lookupFunction<_YoloMultiTaskSetBackendC, _YoloMultiTaskSetBackendDart>('yolo_multitask_set_backend');
+    _multiTaskForwardYuv420 = _lib.lookupFunction<_YoloMultiTaskForwardYuv420C, _YoloMultiTaskForwardYuv420Dart>('yolo_multitask_forward_yuv420');
+    _multiTaskForwardRgba = _lib.lookupFunction<_YoloMultiTaskForwardRgbaC, _YoloMultiTaskForwardRgbaDart>('yolo_multitask_forward_rgba');
+    _multiTaskDestroy = _lib.lookupFunction<_YoloMultiTaskDestroyC, _YoloMultiTaskDestroyDart>('yolo_multitask_destroy');
 
     // Allocate persistent buffers once
     _persistentFrameResult = calloc<YoloFrameResult>();
+    _persistentSegResult = calloc<YoloSegmentationResult>();
+    _persistentPoseResult = calloc<YoloPoseResult>();
+    _persistentClsResult = calloc<YoloClassificationResult>();
+    _persistentObbResult = calloc<YoloObbResult>();
     _persistentOutputTensor = calloc<Float>(84 * 8400);
   }
 
-  /// Singleton access or custom factory
   static YoloNcnnEngine getInstance({String? customLibPath}) {
     if (_instance != null) return _instance!;
 
-    final DynamicLibrary lib;
-    if (customLibPath != null) {
-      lib = DynamicLibrary.open(customLibPath);
-    } else if (Platform.isAndroid) {
-      lib = DynamicLibrary.open('libyolo_ncnn.so');
-    } else if (Platform.isWindows) {
-      lib = DynamicLibrary.open('yolo_ncnn.dll');
-    } else if (Platform.isLinux) {
-      lib = DynamicLibrary.open('libyolo_ncnn.so');
+    DynamicLibrary lib;
+    if (Platform.isAndroid) {
+      try {
+        lib = DynamicLibrary.open(customLibPath ?? 'libyolo_ncnn.so');
+      } catch (e) {
+        throw StateError(
+          'FATAL: Failed to load libyolo_ncnn.so. Ensure native library is packaged: $e',
+        );
+      }
     } else {
-      throw UnsupportedError(
-          'Platform not supported for native YOLO NCNN engine');
+      throw UnsupportedError('YOLO NCNN Engine supports Android arm64-v8a only.');
     }
 
     _instance = YoloNcnnEngine._(lib);
     return _instance!;
   }
 
-  /// Extracts model assets from bundle to disk and validates metadata contract
-  static Future<int> setupAndValidateModelAssets({
-    required Function(String paramPath, String binPath) onReady,
-  }) async {
-    try {
-      // 1. Validate metadata contract
-      final metadataStr =
-          await rootBundle.loadString('assets/models/model_metadata.json');
-      final Map<String, dynamic> metadata =
-          json.decode(metadataStr) as Map<String, dynamic>;
-
-      final input = metadata['input'] as Map<String, dynamic>?;
-      final output = metadata['output'] as Map<String, dynamic>?;
-
-      if (input == null ||
-          input['name'] != 'in0' ||
-          input['shape']?[2] != 640 ||
-          input['shape']?[3] != 640) {
-        return YoloEngineErrors.metadataValidationFailed;
-      }
-
-      if (output == null ||
-          output['name'] != 'out0' ||
-          output['shape']?[1] != 84 ||
-          output['shape']?[2] != 8400) {
-        return YoloEngineErrors.metadataValidationFailed;
-      }
-
-      // 2. Extract model files to Application Support Directory
-      final supportDir = await getApplicationSupportDirectory();
-      final paramFile = File('${supportDir.path}/model.ncnn.param');
-      final binFile = File('${supportDir.path}/model.ncnn.bin');
-
-      if (!await paramFile.exists()) {
-        final paramBytes =
-            await rootBundle.load('assets/models/model.ncnn.param');
-        await paramFile.writeAsBytes(paramBytes.buffer.asUint8List(),
-            flush: true);
-      }
-
-      if (!await binFile.exists()) {
-        final binBytes = await rootBundle.load('assets/models/model.ncnn.bin');
-        await binFile.writeAsBytes(binBytes.buffer.asUint8List(), flush: true);
-      }
-
-      onReady(paramFile.path, binFile.path);
-      return YoloEngineErrors.success;
-    } catch (_) {
-      return YoloEngineErrors.modelExtractionFailed;
-    }
+  /// Initialize Legacy Detection Engine
+  Future<int> init({int useVulkan = 0}) async {
+    final extractedPaths = await _extractModelFiles(
+      paramAsset: 'assets/models/model.ncnn.param',
+      binAsset: 'assets/models/model.ncnn.bin',
+    );
+    return initWithPaths(
+      paramPath: extractedPaths['param']!,
+      binPath: extractedPaths['bin']!,
+      useVulkan: useVulkan,
+    );
   }
 
-  /// Initialize model network graph and weights
+  /// Initialize model with DiagnosticsService signature
   int initModel({
     required String paramPath,
     required String binPath,
     bool useVulkan = false,
   }) {
-    final paramPathPtr = paramPath.toNativeUtf8();
-    final binPathPtr = binPath.toNativeUtf8();
+    return initWithPaths(
+      paramPath: paramPath,
+      binPath: binPath,
+      useVulkan: useVulkan ? 1 : 0,
+    );
+  }
+
+  /// Initialize with explicit paths (Detection)
+  int initWithPaths({
+    required String paramPath,
+    required String binPath,
+    int useVulkan = 0,
+  }) {
+    final paramPtr = paramPath.toNativeUtf8();
+    final binPtr = binPath.toNativeUtf8();
 
     try {
-      final ret = _init(paramPathPtr, binPathPtr, useVulkan ? 1 : 0);
+      final ret = _init(paramPtr, binPtr, useVulkan);
       _isInitialized = (ret == 0);
-      return _isInitialized
-          ? YoloEngineErrors.success
-          : YoloEngineErrors.nativeInitFailed;
+      _activeTask = VisionTask.detection;
+      return ret;
     } finally {
-      calloc.free(paramPathPtr);
-      calloc.free(binPathPtr);
+      calloc.free(paramPtr);
+      calloc.free(binPtr);
     }
   }
 
-  /// Switch backend dynamically between ARM NEON CPU (0) and Vulkan GPU (1)
-  int setBackend({required bool useVulkan}) {
-    return _setBackend(useVulkan ? 1 : 0);
+  /// Initialize Multi-Task Engine with explicit task, model files, resolution, and backend
+  int initMultiTask({
+    required VisionTask task,
+    required String paramPath,
+    required String binPath,
+    int targetSize = 640,
+    int backend = 0,
+  }) {
+    final paramPtr = paramPath.toNativeUtf8();
+    final binPtr = binPath.toNativeUtf8();
+
+    try {
+      final ret = _multiTaskInit(task.id, paramPtr, binPtr, targetSize, backend);
+      _isInitialized = (ret == 0);
+      _activeTask = task;
+      return ret;
+    } finally {
+      calloc.free(paramPtr);
+      calloc.free(binPtr);
+    }
   }
 
-  /// Process YUV420/NV21 camera frame with zero heap allocation per frame
+  int setBackend({int backend = 0, bool? useVulkan}) {
+    if (!_isInitialized) return -1;
+    final b = useVulkan != null ? (useVulkan ? 1 : 0) : backend;
+    return _multiTaskSetBackend(b);
+  }
+
+  int setTargetSize(int targetSize) {
+    if (!_isInitialized) return -1;
+    return _multiTaskSetSize(targetSize);
+  }
+
+  /// Forward YUV420 frame through active task pipeline
+  int forwardTaskYuv420({
+    required Pointer<Uint8> yPlane,
+    required Pointer<Uint8> uPlane,
+    required Pointer<Uint8> vPlane,
+    required int width,
+    required int height,
+    required int yRowStride,
+    required int uvRowStride,
+    required int uvPixelStride,
+    required int sensorOrientation,
+    required Pointer<Void> outBuffer,
+  }) {
+    if (!_isInitialized) return -1;
+    return _multiTaskForwardYuv420(
+      yPlane,
+      uPlane,
+      vPlane,
+      width,
+      height,
+      yRowStride,
+      uvRowStride,
+      uvPixelStride,
+      sensorOrientation,
+      outBuffer,
+    );
+  }
+
+  /// Forward RGBA frame through active task pipeline
+  int forwardTaskRgba({
+    required Pointer<Uint8> rgba,
+    required int width,
+    required int height,
+    required int sensorOrientation,
+    required Pointer<Void> outBuffer,
+  }) {
+    if (!_isInitialized) return -1;
+    return _multiTaskForwardRgba(rgba, width, height, sensorOrientation, outBuffer);
+  }
+
+  /// Legacy forward YUV420 (for Detection)
   int forwardYuv420({
     required Pointer<Uint8> yPlane,
     required Pointer<Uint8> uPlane,
@@ -218,7 +330,8 @@ class YoloNcnnEngine {
     required int sensorOrientation,
     Pointer<YoloFrameResult>? outResult,
   }) {
-    final targetResult = outResult ?? _persistentFrameResult;
+    if (!_isInitialized) return -1;
+    final dest = outResult ?? _persistentFrameResult;
     return _forwardYuv420(
       yPlane,
       uPlane,
@@ -229,11 +342,11 @@ class YoloNcnnEngine {
       uvRowStride,
       uvPixelStride,
       sensorOrientation,
-      targetResult,
+      dest,
     );
   }
 
-  /// Process RGBA frame buffer (e.g., benchmark sample images) with zero heap allocation
+  /// Legacy forward RGBA (for Detection)
   int forwardRgba({
     required Pointer<Uint8> rgba,
     required int width,
@@ -241,23 +354,54 @@ class YoloNcnnEngine {
     required int sensorOrientation,
     Pointer<YoloFrameResult>? outResult,
   }) {
-    final targetResult = outResult ?? _persistentFrameResult;
-    return _forwardRgba(
-      rgba,
-      width,
-      height,
-      sensorOrientation,
-      targetResult,
-    );
+    if (!_isInitialized) return -1;
+    final dest = outResult ?? _persistentFrameResult;
+    return _forwardRgba(rgba, width, height, sensorOrientation, dest);
   }
 
-  /// Free native engine, persistent buffers, and GPU resources
   void destroy() {
     if (_isInitialized) {
-      _destroy();
+      _multiTaskDestroy();
       _isInitialized = false;
     }
     calloc.free(_persistentFrameResult);
+    calloc.free(_persistentSegResult);
+    calloc.free(_persistentPoseResult);
+    calloc.free(_persistentClsResult);
+    calloc.free(_persistentObbResult);
     calloc.free(_persistentOutputTensor);
+    _instance = null;
+  }
+
+  static Future<Map<String, String>> _extractModelFiles({
+    required String paramAsset,
+    required String binAsset,
+  }) async {
+    final tempDir = await getTemporaryDirectory();
+    final modelsDir = Directory('${tempDir.path}/models');
+    if (!modelsDir.existsSync()) {
+      modelsDir.createSync(recursive: true);
+    }
+
+    final paramName = paramAsset.split('/').last;
+    final binName = binAsset.split('/').last;
+
+    final paramFile = File('${modelsDir.path}/$paramName');
+    final binFile = File('${modelsDir.path}/$binName');
+
+    if (!paramFile.existsSync()) {
+      final paramData = await rootBundle.load(paramAsset);
+      await paramFile.writeAsBytes(paramData.buffer.asUint8List(), flush: true);
+    }
+
+    if (!binFile.existsSync()) {
+      final binData = await rootBundle.load(binAsset);
+      await binFile.writeAsBytes(binData.buffer.asUint8List(), flush: true);
+    }
+
+    return {
+      'param': paramFile.path,
+      'bin': binFile.path,
+    };
   }
 }

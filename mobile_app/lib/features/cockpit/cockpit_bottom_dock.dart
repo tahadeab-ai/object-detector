@@ -15,6 +15,8 @@ class CockpitBottomDock extends StatelessWidget {
   final VoidCallback onOpenSettings;
   final VoidCallback onOpenDiagnostics;
   final VoidCallback onSwitchCamera;
+  final VoidCallback onOpenModelManager;
+  final VoidCallback onOpenPerformanceDashboard;
 
   const CockpitBottomDock({
     super.key,
@@ -28,6 +30,8 @@ class CockpitBottomDock extends StatelessWidget {
     required this.onOpenSettings,
     required this.onOpenDiagnostics,
     required this.onSwitchCamera,
+    required this.onOpenModelManager,
+    required this.onOpenPerformanceDashboard,
   });
 
   Widget _buildDockButton({
@@ -137,13 +141,27 @@ class CockpitBottomDock extends StatelessWidget {
             onTap: onSwitchCamera,
           ),
 
-          // 6. Settings Bottom Sheet
+          // 6. Model & Task Manager
+          _buildDockButton(
+            icon: Icons.view_in_ar_rounded,
+            onTap: onOpenModelManager,
+            color: AppTokens.catVehicle,
+          ),
+
+          // 7. Performance Dashboard
+          _buildDockButton(
+            icon: Icons.speed_rounded,
+            onTap: onOpenPerformanceDashboard,
+            color: AppTokens.catIndoor,
+          ),
+
+          // 8. Settings Bottom Sheet
           _buildDockButton(
             icon: Icons.tune_rounded,
             onTap: onOpenSettings,
           ),
 
-          // 7. Diagnostics JSON Export
+          // 9. Diagnostics JSON Export
           _buildDockButton(
             icon: Icons.analytics_outlined,
             onTap: onOpenDiagnostics,

@@ -1,0 +1,77 @@
+[
+  {
+    "id": 0,
+    "name_en": "plane",
+    "name_ar": "طائرة"
+  },
+  {
+    "id": 1,
+    "name_en": "baseball diamond",
+    "name_ar": "ملعب بيسبول"
+  },
+  {
+    "id": 2,
+    "name_en": "bridge",
+    "name_ar": "جسر"
+  },
+  {
+    "id": 3,
+    "name_en": "ground track field",
+    "name_ar": "مضمار سباق"
+  },
+  {
+    "id": 4,
+    "name_en": "small vehicle",
+    "name_ar": "مركبة صغيرة"
+  },
+  {
+    "id": 5,
+    "name_en": "large vehicle",
+    "name_ar": "مركبة كبيرة"
+  },
+  {
+    "id": 6,
+    "name_en": "ship",
+    "name_ar": "سفينة"
+  },
+  {
+    "id": 7,
+    "name_en": "tennis court",
+    "name_ar": "ملعب تنس"
+  },
+  {
+    "id": 8,
+    "name_en": "basketball court",
+    "name_ar": "ملعب كرة سلة"
+  },
+  {
+    "id": 9,
+    "name_en": "storage tank",
+    "name_ar": "خزان تخزين"
+  },
+  {
+    "id": 10,
+    "name_en": "soccer ball field",
+    "name_ar": "ملعب كرة قدم"
+  },
+  {
+    "id": 11,
+    "name_en": "roundabout",
+    "name_ar": "دوار مروري"
+  },
+  {
+    "id": 12,
+    "name_en": "harbor",
+    "name_ar": "ميناء"
+  },
+  {
+    "id": 13,
+    "name_en": "swimming pool",
+    "name_ar": "مسبح"
+  },
+  {
+    "id": 14,
+    "name_en": "helicopter",
+    "name_ar": "مروحية"
+  }
+]

@@ -3,18 +3,26 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import '../../core/ffi/native_structs.dart';
 import '../../core/l10n/coco_labels_repository.dart';
+import '../../core/l10n/multitask_labels_repository.dart';
 import '../../core/models/detection_item.dart';
 import '../../core/models/engine_telemetry.dart';
+import '../../core/models/model_profile.dart';
+import '../../core/models/multitask_results.dart';
 import '../../core/services/camera_permission_service.dart';
 import '../../core/services/detection_event_bus.dart';
 import '../../core/services/diagnostics_service.dart';
 import '../../core/services/inference_worker.dart';
+import '../../core/services/model_manager.dart';
 import '../../core/theme/design_tokens.dart';
+import '../dashboard/performance_dashboard_screen.dart';
 import '../diagnostics/diagnostics_screen.dart';
+import '../model_manager/model_manager_screen.dart';
 import '../sample_mode/sample_benchmark_view.dart';
 import '../settings/engine_settings_sheet.dart';
 import 'bbox_hud_painter.dart';
 import 'cockpit_bottom_dock.dart';
+import 'multitask_hud_painter.dart';
+import 'task_selector_strip.dart';
 import 'telemetry_top_bar.dart';
 
 class CockpitScreen extends StatefulWidget {
@@ -43,12 +51,19 @@ class _CockpitScreenState extends State<CockpitScreen>
   int _activeBackend = 0; // 0=CPU (NEON 4T), 1=Vulkan
 
   List<DetectionItem> _currentDetections = [];
+  List<SegmentationItem> _currentSegmentations = [];
+  List<PoseItem> _currentPoses = [];
+  List<ClassificationItem> _currentClassifications = [];
+  List<ObbItem> _currentObbs = [];
+
   EngineTelemetry _currentTelemetry = const EngineTelemetry();
 
   StreamSubscription<FrameDetectionEvent>? _eventSub;
   final CocoLabelsRepository _labelsRepo = CocoLabelsRepository();
+  final MultiTaskLabelsRepository _multiTaskRepo = MultiTaskLabelsRepository();
   final DiagnosticsService _diagService = DiagnosticsService();
   final InferenceWorker _inferenceWorker = InferenceWorker();
+  final ModelManager _modelManager = ModelManager();
 
   int _frameCounter = 0;
   DateTime _lastFpsUpdate = DateTime.now();
@@ -64,6 +79,8 @@ class _CockpitScreenState extends State<CockpitScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _labelsRepo.load();
+    _multiTaskRepo.load();
+    _modelManager.addListener(_onModelManagerChanged);
     _availableCameras = List.from(widget.cameras);
 
     _eventSub = DetectionEventBus().stream.listen((event) {
@@ -253,8 +270,10 @@ class _CockpitScreenState extends State<CockpitScreen>
       final sensorOrientation =
           _cameraController?.description.sensorOrientation ?? 90;
 
-      // Delegate inference to dedicated worker isolate
-      final result = await _inferenceWorker.processFrame(
+      final activeTask = _modelManager.activeTask;
+
+      // Delegate multi-task inference to dedicated background isolate
+      final result = await _inferenceWorker.processMultiTaskFrame(
         yBytes: yPlane.bytes,
         uBytes: uPlane.bytes,
         vBytes: vPlane.bytes,
@@ -265,6 +284,7 @@ class _CockpitScreenState extends State<CockpitScreen>
         uvPixelStride: uvPixelStride,
         sensorOrientation: sensorOrientation,
         backend: _activeBackend,
+        task: activeTask,
       );
 
       if (result != null && result.statusCode == 0) {
@@ -272,20 +292,20 @@ class _CockpitScreenState extends State<CockpitScreen>
         _diagService.recordFrameProcessed();
 
         final detections = <DetectionItem>[];
-        for (final b in result.boxes) {
-          if (b.confidence < _confThreshold) continue;
-          detections.add(DetectionItem(
-            x1: b.x1.clamp(0.0, 1.0),
-            y1: b.y1.clamp(0.0, 1.0),
-            x2: b.x2.clamp(0.0, 1.0),
-            y2: b.y2.clamp(0.0, 1.0),
-            confidence: b.confidence,
-            classId: b.classId,
-            trackId: b.trackId,
-            trackState: TrackState.fromInt(b.trackState),
-            spatialZone: SpatialZone.fromInt(b.spatialZone),
-            proximityTier: ProximityTier.fromInt(b.proximityTier),
-          ));
+        for (final item in result.detections) {
+          if (item.confidence >= _confThreshold) {
+            detections.add(item);
+          }
+        }
+
+        if (mounted) {
+          setState(() {
+            _currentDetections = detections;
+            _currentSegmentations = result.segmentations;
+            _currentPoses = result.poses;
+            _currentClassifications = result.classifications;
+            _currentObbs = result.obbs;
+          });
         }
 
         DetectionEventBus().publish(
@@ -294,8 +314,9 @@ class _CockpitScreenState extends State<CockpitScreen>
             detections: detections,
             telemetry: _currentTelemetry.copyWith(
               inferenceTimeMs: result.inferenceTimeMs,
-              trackerTimeMs: result.trackerTimeMs,
-              totalLatencyMs: result.inferenceTimeMs + result.trackerTimeMs,
+              trackerTimeMs: result.postTimeMs,
+              totalLatencyMs:
+                  result.prepTimeMs + result.inferenceTimeMs + result.postTimeMs,
               activeBackend: result.activeBackend,
               activeTracks: detections.length,
               confirmedTracks:
@@ -411,11 +432,56 @@ class _CockpitScreenState extends State<CockpitScreen>
     }
   }
 
+  void _onModelManagerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _onTaskChanged(VisionTask task) async {
+    if (_modelManager.activeTask == task) return;
+
+    final targetProfile = ModelProfile.catalog.firstWhere(
+      (p) => p.task == task,
+      orElse: () => ModelProfile.catalog.first,
+    );
+
+    final success = await _modelManager.switchModel(targetProfile);
+    if (mounted && !success) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: AppTokens.danger,
+          content: Text(
+            _isArabic ? 'فشل تبديل المهمة' : 'Failed to switch task',
+            style: const TextStyle(fontFamily: AppTokens.fontCairo),
+          ),
+        ),
+      );
+    }
+  }
+
+  void _openModelManager() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ModelManagerScreen(isArabic: _isArabic),
+      ),
+    );
+  }
+
+  void _openPerformanceDashboard() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PerformanceDashboardScreen(isArabic: _isArabic),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _stopWatchdog();
     WidgetsBinding.instance.removeObserver(this);
     _eventSub?.cancel();
+    _modelManager.removeListener(_onModelManagerChanged);
     _cameraController?.dispose();
     _inferenceWorker.stop();
     super.dispose();
@@ -447,11 +513,17 @@ class _CockpitScreenState extends State<CockpitScreen>
                       CameraPreview(_cameraController!),
                       RepaintBoundary(
                         child: CustomPaint(
-                          painter: BBoxHudPainter(
-                            detections: _currentDetections,
+                          painter: MultiTaskHudPainter(
+                            task: _modelManager.activeTask,
                             isArabic: _isArabic,
                             showTrails: true,
-                            repo: _labelsRepo,
+                            detections: _currentDetections,
+                            segmentations: _currentSegmentations,
+                            poses: _currentPoses,
+                            classifications: _currentClassifications,
+                            obbs: _currentObbs,
+                            multiTaskRepo: _multiTaskRepo,
+                            cocoLabelsRepo: _labelsRepo,
                           ),
                         ),
                       ),
@@ -589,7 +661,22 @@ class _CockpitScreenState extends State<CockpitScreen>
             ),
           ),
 
-          // 5. Minimal Tactical Floating Bottom Dock
+          // 5. Tactical Task Navigation Strip (Detection, Seg, Pose, Cls, OBB)
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 62,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: TaskSelectorStrip(
+                isArabic: _isArabic,
+                activeTask: _modelManager.activeTask,
+                isLoading: _modelManager.isLoading,
+                onTaskSelected: _onTaskChanged,
+              ),
+            ),
+          ),
+
+          // 6. Minimal Tactical Floating Bottom Dock
           Positioned(
             bottom: MediaQuery.of(context).padding.bottom + 12,
             left: 16,
@@ -606,6 +693,8 @@ class _CockpitScreenState extends State<CockpitScreen>
                 onOpenSettings: _openSettings,
                 onOpenDiagnostics: _openDiagnostics,
                 onSwitchCamera: _switchCamera,
+                onOpenModelManager: _openModelManager,
+                onOpenPerformanceDashboard: _openPerformanceDashboard,
               ),
             ),
           ),

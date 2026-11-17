@@ -2,9 +2,12 @@ import 'dart:async';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:ffi/ffi.dart';
 import '../ffi/native_structs.dart';
 import '../ffi/yolo_ncnn_ffi.dart';
+import '../models/detection_item.dart';
+import '../models/multitask_results.dart';
 
 class IsolateBoxData {
   final double x1;
@@ -61,6 +64,7 @@ class _InferenceTask {
   final int uvPixelStride;
   final int sensorOrientation;
   final int backend;
+  final int taskId; // 0=Det, 1=Seg, 2=Pose, 3=Cls, 4=Obb
 
   const _InferenceTask({
     required this.yBytes,
@@ -72,6 +76,23 @@ class _InferenceTask {
     required this.uvRowStride,
     required this.uvPixelStride,
     required this.sensorOrientation,
+    required this.backend,
+    this.taskId = 0,
+  });
+}
+
+class _SwitchModelMessage {
+  final int taskId;
+  final String paramPath;
+  final String binPath;
+  final int targetSize;
+  final int backend;
+
+  const _SwitchModelMessage({
+    required this.taskId,
+    required this.paramPath,
+    required this.binPath,
+    required this.targetSize,
     required this.backend,
   });
 }
@@ -85,7 +106,7 @@ class InferenceWorker {
   Isolate? _isolate;
   SendPort? _sendPort;
   Completer<void>? _initCompleter;
-  Completer<IsolateFrameResult>? _currentTaskCompleter;
+  Completer<dynamic>? _currentTaskCompleter;
   bool _isBusy = false;
 
   bool get isBusy => _isBusy;
@@ -104,8 +125,8 @@ class InferenceWorker {
       _sendPort = await events.first as SendPort;
 
       events.listen((message) {
-        if (message is IsolateFrameResult) {
-          _isBusy = false;
+        _isBusy = false;
+        if (_currentTaskCompleter != null && !_currentTaskCompleter!.isCompleted) {
           _currentTaskCompleter?.complete(message);
           _currentTaskCompleter = null;
         }
@@ -118,8 +139,33 @@ class InferenceWorker {
     }
   }
 
-  /// Single-Slot Latest-Frame Gate:
-  /// Submits a frame for processing. Returns null if worker is currently busy.
+  /// Switch model in the background isolate
+  Future<bool> switchModelInIsolate({
+    required int taskId,
+    required String paramPath,
+    required String binPath,
+    required int targetSize,
+    required int backend,
+  }) async {
+    if (_sendPort == null) return false;
+
+    _isBusy = true;
+    final comp = Completer<dynamic>();
+    _currentTaskCompleter = comp;
+
+    _sendPort!.send(_SwitchModelMessage(
+      taskId: taskId,
+      paramPath: paramPath,
+      binPath: binPath,
+      targetSize: targetSize,
+      backend: backend,
+    ));
+
+    final res = await comp.future;
+    return res == 0;
+  }
+
+  /// Single-Slot Latest-Frame Gate for Detection (Backward Compatible)
   Future<IsolateFrameResult?> processFrame({
     required Uint8List yBytes,
     required Uint8List uBytes,
@@ -137,7 +183,8 @@ class InferenceWorker {
     }
 
     _isBusy = true;
-    _currentTaskCompleter = Completer<IsolateFrameResult>();
+    final comp = Completer<dynamic>();
+    _currentTaskCompleter = comp;
 
     final task = _InferenceTask(
       yBytes: yBytes,
@@ -150,10 +197,55 @@ class InferenceWorker {
       uvPixelStride: uvPixelStride,
       sensorOrientation: sensorOrientation,
       backend: backend,
+      taskId: 0,
     );
 
     _sendPort!.send(task);
-    return _currentTaskCompleter!.future;
+    final res = await comp.future;
+    if (res is IsolateFrameResult) return res;
+    return null;
+  }
+
+  /// Single-Slot Multi-Task Frame Processing
+  Future<MultiTaskFrameResult?> processMultiTaskFrame({
+    required Uint8List yBytes,
+    required Uint8List uBytes,
+    required Uint8List vBytes,
+    required int width,
+    required int height,
+    required int yRowStride,
+    required int uvRowStride,
+    required int uvPixelStride,
+    required int sensorOrientation,
+    required int backend,
+    required VisionTask task,
+  }) async {
+    if (_isBusy || _sendPort == null) {
+      return null;
+    }
+
+    _isBusy = true;
+    final comp = Completer<dynamic>();
+    _currentTaskCompleter = comp;
+
+    final inferenceTask = _InferenceTask(
+      yBytes: yBytes,
+      uBytes: uBytes,
+      vBytes: vBytes,
+      width: width,
+      height: height,
+      yRowStride: yRowStride,
+      uvRowStride: uvRowStride,
+      uvPixelStride: uvPixelStride,
+      sensorOrientation: sensorOrientation,
+      backend: backend,
+      taskId: task.id,
+    );
+
+    _sendPort!.send(inferenceTask);
+    final res = await comp.future;
+    if (res is MultiTaskFrameResult) return res;
+    return null;
   }
 
   void stop() {
@@ -171,9 +263,25 @@ class InferenceWorker {
     final engine = YoloNcnnEngine.getInstance();
 
     port.listen((message) {
+      if (message is _SwitchModelMessage) {
+        try {
+          final ret = engine.initMultiTask(
+            task: VisionTask.fromId(message.taskId),
+            paramPath: message.paramPath,
+            binPath: message.binPath,
+            targetSize: message.targetSize,
+            backend: message.backend,
+          );
+          replyPort.send(ret);
+        } catch (_) {
+          replyPort.send(-1);
+        }
+        return;
+      }
+
       if (message is _InferenceTask) {
         try {
-          engine.setBackend(useVulkan: message.backend == 1);
+          engine.setBackend(backend: message.backend);
 
           final yPtr = calloc<Uint8>(message.yBytes.length);
           yPtr.asTypedList(message.yBytes.length).setAll(0, message.yBytes);
@@ -184,69 +292,283 @@ class InferenceWorker {
           final vPtr = calloc<Uint8>(message.vBytes.length);
           vPtr.asTypedList(message.vBytes.length).setAll(0, message.vBytes);
 
-          final outResult = engine.persistentResultBuffer;
-          final ret = engine.forwardYuv420(
-            yPlane: yPtr,
-            uPlane: uPtr,
-            vPlane: vPtr,
-            width: message.width,
-            height: message.height,
-            yRowStride: message.yRowStride,
-            uvRowStride: message.uvRowStride,
-            uvPixelStride: message.uvPixelStride,
-            sensorOrientation: message.sensorOrientation,
-            outResult: outResult,
-          );
+          final task = VisionTask.fromId(message.taskId);
 
-          calloc.free(yPtr);
-          calloc.free(uPtr);
-          calloc.free(vPtr);
+          if (task == VisionTask.detection) {
+            final outResult = engine.persistentResultBuffer;
+            final ret = engine.forwardYuv420(
+              yPlane: yPtr,
+              uPlane: uPtr,
+              vPlane: vPtr,
+              width: message.width,
+              height: message.height,
+              yRowStride: message.yRowStride,
+              uvRowStride: message.uvRowStride,
+              uvPixelStride: message.uvPixelStride,
+              sensorOrientation: message.sensorOrientation,
+              outResult: outResult,
+            );
 
-          if (ret == 0) {
-            final res = outResult.ref;
-            final boxes = <IsolateBoxData>[];
-            for (int k = 0; k < res.numDetections && k < yoloMaxBoxes; k++) {
-              final b = res.boxes[k];
-              boxes.add(IsolateBoxData(
-                x1: b.x1,
-                y1: b.y1,
-                x2: b.x2,
-                y2: b.y2,
-                confidence: b.confidence,
-                classId: b.classId,
-                trackId: b.trackId,
-                trackState: b.trackState,
-                spatialZone: b.spatialZone,
-                proximityTier: b.proximityTier,
+            calloc.free(yPtr);
+            calloc.free(uPtr);
+            calloc.free(vPtr);
+
+            if (ret == 0) {
+              final res = outResult.ref;
+              final boxes = <IsolateBoxData>[];
+              final detItems = <DetectionItem>[];
+              for (int k = 0; k < res.numDetections && k < yoloMaxBoxes; k++) {
+                final b = res.boxes[k];
+                boxes.add(IsolateBoxData(
+                  x1: b.x1,
+                  y1: b.y1,
+                  x2: b.x2,
+                  y2: b.y2,
+                  confidence: b.confidence,
+                  classId: b.classId,
+                  trackId: b.trackId,
+                  trackState: b.trackState,
+                  spatialZone: b.spatialZone,
+                  proximityTier: b.proximityTier,
+                ));
+                detItems.add(DetectionItem(
+                  x1: b.x1,
+                  y1: b.y1,
+                  x2: b.x2,
+                  y2: b.y2,
+                  confidence: b.confidence,
+                  classId: b.classId,
+                  trackId: b.trackId,
+                  trackState: TrackState.fromInt(b.trackState),
+                  spatialZone: SpatialZone.fromInt(b.spatialZone),
+                  proximityTier: ProximityTier.fromInt(b.proximityTier),
+                ));
+              }
+
+              // Send MultiTaskFrameResult if multi-task or IsolateFrameResult
+              replyPort.send(MultiTaskFrameResult(
+                task: VisionTask.detection,
+                frameId: res.frameId,
+                prepTimeMs: 0.0,
+                inferenceTimeMs: res.inferenceTimeMs.toDouble(),
+                postTimeMs: res.trackerTimeMs.toDouble(),
+                activeBackend: res.activeBackend,
+                statusCode: res.statusCode,
+                detections: detItems,
+              ));
+            } else {
+              replyPort.send(MultiTaskFrameResult(
+                task: VisionTask.detection,
+                frameId: 0,
+                prepTimeMs: 0,
+                inferenceTimeMs: 0,
+                postTimeMs: 0,
+                activeBackend: 0,
+                statusCode: ret,
+              ));
+            }
+          } else if (task == VisionTask.segmentation) {
+            final segBuffer = engine.persistentSegBuffer;
+            final ret = engine.forwardTaskYuv420(
+              yPlane: yPtr,
+              uPlane: uPtr,
+              vPlane: vPtr,
+              width: message.width,
+              height: message.height,
+              yRowStride: message.yRowStride,
+              uvRowStride: message.uvRowStride,
+              uvPixelStride: message.uvPixelStride,
+              sensorOrientation: message.sensorOrientation,
+              outBuffer: segBuffer.cast(),
+            );
+
+            calloc.free(yPtr);
+            calloc.free(uPtr);
+            calloc.free(vPtr);
+
+            final res = segBuffer.ref;
+            final segItems = <SegmentationItem>[];
+            for (int i = 0; i < res.numObjects && i < maxSegObjects; i++) {
+              final obj = res.objects[i];
+              final pts = <Offset>[];
+              for (int k = 0; k < obj.numContourPoints && k < maxContourPoints; k++) {
+                pts.add(Offset(obj.contourPoints[k * 2], obj.contourPoints[k * 2 + 1]));
+              }
+              segItems.add(SegmentationItem(
+                x1: obj.x1,
+                y1: obj.y1,
+                x2: obj.x2,
+                y2: obj.y2,
+                confidence: obj.confidence,
+                classId: obj.classId,
+                maskW: obj.maskW,
+                maskH: obj.maskH,
+                contourPoints: pts,
               ));
             }
 
-            replyPort.send(IsolateFrameResult(
-              frameId: res.frameId,
-              inferenceTimeMs: res.inferenceTimeMs.toDouble(),
-              trackerTimeMs: res.trackerTimeMs.toDouble(),
-              activeBackend: res.activeBackend,
-              statusCode: res.statusCode,
-              boxes: boxes,
-            ));
-          } else {
-            replyPort.send(IsolateFrameResult(
-              frameId: 0,
-              inferenceTimeMs: 0,
-              trackerTimeMs: 0,
-              activeBackend: 0,
+            replyPort.send(MultiTaskFrameResult(
+              task: VisionTask.segmentation,
+              frameId: res.header.frameId,
+              prepTimeMs: res.header.preprocessingTimeMs,
+              inferenceTimeMs: res.header.inferenceTimeMs,
+              postTimeMs: res.header.postprocessingTimeMs,
+              activeBackend: res.header.activeBackend,
               statusCode: ret,
-              boxes: const [],
+              segmentations: segItems,
+            ));
+          } else if (task == VisionTask.pose) {
+            final poseBuffer = engine.persistentPoseBuffer;
+            final ret = engine.forwardTaskYuv420(
+              yPlane: yPtr,
+              uPlane: uPtr,
+              vPlane: vPtr,
+              width: message.width,
+              height: message.height,
+              yRowStride: message.yRowStride,
+              uvRowStride: message.uvRowStride,
+              uvPixelStride: message.uvPixelStride,
+              sensorOrientation: message.sensorOrientation,
+              outBuffer: poseBuffer.cast(),
+            );
+
+            calloc.free(yPtr);
+            calloc.free(uPtr);
+            calloc.free(vPtr);
+
+            final res = poseBuffer.ref;
+            final poseItems = <PoseItem>[];
+            for (int i = 0; i < res.numObjects && i < maxPoseObjects; i++) {
+              final obj = res.objects[i];
+              final kps = <KeyPointData>[];
+              for (int k = 0; k < poseKeypointsCount; k++) {
+                kps.add(KeyPointData(
+                  x: obj.keypoints[k].x,
+                  y: obj.keypoints[k].y,
+                  confidence: obj.keypoints[k].confidence,
+                ));
+              }
+              poseItems.add(PoseItem(
+                x1: obj.x1,
+                y1: obj.y1,
+                x2: obj.x2,
+                y2: obj.y2,
+                confidence: obj.confidence,
+                classId: obj.classId,
+                keypoints: kps,
+              ));
+            }
+
+            replyPort.send(MultiTaskFrameResult(
+              task: VisionTask.pose,
+              frameId: res.header.frameId,
+              prepTimeMs: res.header.preprocessingTimeMs,
+              inferenceTimeMs: res.header.inferenceTimeMs,
+              postTimeMs: res.header.postprocessingTimeMs,
+              activeBackend: res.header.activeBackend,
+              statusCode: ret,
+              poses: poseItems,
+            ));
+          } else if (task == VisionTask.classification) {
+            final clsBuffer = engine.persistentClsBuffer;
+            final ret = engine.forwardTaskYuv420(
+              yPlane: yPtr,
+              uPlane: uPtr,
+              vPlane: vPtr,
+              width: message.width,
+              height: message.height,
+              yRowStride: message.yRowStride,
+              uvRowStride: message.uvRowStride,
+              uvPixelStride: message.uvPixelStride,
+              sensorOrientation: message.sensorOrientation,
+              outBuffer: clsBuffer.cast(),
+            );
+
+            calloc.free(yPtr);
+            calloc.free(uPtr);
+            calloc.free(vPtr);
+
+            final res = clsBuffer.ref;
+            final clsItems = <ClassificationItem>[];
+            for (int i = 0; i < res.numItems && i < maxTopK; i++) {
+              clsItems.add(ClassificationItem(
+                classId: res.items[i].classId,
+                confidence: res.items[i].confidence,
+              ));
+            }
+
+            replyPort.send(MultiTaskFrameResult(
+              task: VisionTask.classification,
+              frameId: res.header.frameId,
+              prepTimeMs: res.header.preprocessingTimeMs,
+              inferenceTimeMs: res.header.inferenceTimeMs,
+              postTimeMs: res.header.postprocessingTimeMs,
+              activeBackend: res.header.activeBackend,
+              statusCode: ret,
+              classifications: clsItems,
+            ));
+          } else if (task == VisionTask.obb) {
+            final obbBuffer = engine.persistentObbBuffer;
+            final ret = engine.forwardTaskYuv420(
+              yPlane: yPtr,
+              uPlane: uPtr,
+              vPlane: vPtr,
+              width: message.width,
+              height: message.height,
+              yRowStride: message.yRowStride,
+              uvRowStride: message.uvRowStride,
+              uvPixelStride: message.uvPixelStride,
+              sensorOrientation: message.sensorOrientation,
+              outBuffer: obbBuffer.cast(),
+            );
+
+            calloc.free(yPtr);
+            calloc.free(uPtr);
+            calloc.free(vPtr);
+
+            final res = obbBuffer.ref;
+            final obbItems = <ObbItem>[];
+            for (int i = 0; i < res.numObjects && i < maxObbObjects; i++) {
+              final obj = res.objects[i];
+              final corners = <Offset>[
+                Offset(obj.corners[0], obj.corners[1]),
+                Offset(obj.corners[2], obj.corners[3]),
+                Offset(obj.corners[4], obj.corners[5]),
+                Offset(obj.corners[6], obj.corners[7]),
+              ];
+              obbItems.add(ObbItem(
+                cx: obj.cx,
+                cy: obj.cy,
+                width: obj.width,
+                height: obj.height,
+                angleRad: obj.angleRad,
+                angleDeg: obj.angleDeg,
+                corners: corners,
+                confidence: obj.confidence,
+                classId: obj.classId,
+              ));
+            }
+
+            replyPort.send(MultiTaskFrameResult(
+              task: VisionTask.obb,
+              frameId: res.header.frameId,
+              prepTimeMs: res.header.preprocessingTimeMs,
+              inferenceTimeMs: res.header.inferenceTimeMs,
+              postTimeMs: res.header.postprocessingTimeMs,
+              activeBackend: res.header.activeBackend,
+              statusCode: ret,
+              obbs: obbItems,
             ));
           }
         } catch (_) {
-          replyPort.send(const IsolateFrameResult(
+          replyPort.send(MultiTaskFrameResult(
+            task: VisionTask.fromId(message.taskId),
             frameId: 0,
+            prepTimeMs: 0,
             inferenceTimeMs: 0,
-            trackerTimeMs: 0,
+            postTimeMs: 0,
             activeBackend: 0,
             statusCode: -999,
-            boxes: [],
           ));
         }
       }
