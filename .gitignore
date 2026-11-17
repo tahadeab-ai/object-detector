@@ -61,16 +61,13 @@ native_core/build/
 *.obj
 *.a
 *.so
+!mobile_app/android/app/src/main/jniLibs/arm64-v8a/libyolo_ncnn.so
 *.dll
 *.dylib
 
-# --- Model Binaries & Dynamic Assets (Distributed via GitHub Releases) ---
-# Per RESTORE-5 & A18, model weights (~5.2 MB) are downloaded from GitHub Release 'model-v1'
+# --- Model Binaries & Assets ---
 *.bin
-
-# --- Go & Redis Microservice ---
-backend_go_redis/bin/
-backend_go_redis/vendor/
+!mobile_app/assets/models/model.ncnn.bin
 *.exe
 *.exe~
 *.test
