@@ -1,11 +1,7 @@
-import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:path_provider/path_provider.dart';
 import '../ffi/native_structs.dart';
-import '../ffi/yolo_ncnn_ffi.dart';
 import '../models/model_profile.dart';
-import 'inference_worker.dart';
+import 'nihui_native_controller.dart';
 
 class ModelManagerState {
   final ModelProfile activeProfile;
@@ -70,33 +66,20 @@ class ModelManager extends ChangeNotifier {
     notifyListeners();
 
     try {
-      debugPrint('[ModelManager] Extracting assets for ${newProfile.nameEn}...');
-      final paths = await _extractAssets(newProfile);
-
-      debugPrint('[ModelManager] Initializing native engine for task: ${newProfile.task.labelEn} at ${targetRes}x$targetRes...');
-      final worker = InferenceWorker();
-      if (worker.isReady) {
-        await worker.switchModelInIsolate(
-          taskId: newProfile.task.id,
-          paramPath: paths['param']!,
-          binPath: paths['bin']!,
-          targetSize: targetRes,
-          backend: targetBackend,
-        );
+      int modelId = 0;
+      if (newProfile.nameEn.toLowerCase().contains('s')) {
+        modelId = targetRes == 640 ? 7 : (targetRes == 480 ? 4 : 1);
+      } else if (newProfile.nameEn.toLowerCase().contains('m')) {
+        modelId = targetRes == 640 ? 8 : (targetRes == 480 ? 5 : 2);
+      } else {
+        modelId = targetRes == 640 ? 6 : (targetRes == 480 ? 3 : 0);
       }
 
-      final engine = YoloNcnnEngine.getInstance();
-      final ret = engine.initMultiTask(
-        task: newProfile.task,
-        paramPath: paths['param']!,
-        binPath: paths['bin']!,
-        targetSize: targetRes,
-        backend: targetBackend,
+      await NihuiNativeController.reloadModel(
+        taskId: newProfile.task.id,
+        modelId: modelId,
+        cpuGpu: targetBackend,
       );
-
-      if (ret != 0) {
-        throw StateError('Native multi-task init failed with code $ret');
-      }
 
       _state = _state.copyWith(
         activeProfile: newProfile,
@@ -124,44 +107,12 @@ class ModelManager extends ChangeNotifier {
       debugPrint('[ModelManager] Resolution $resolution not supported by active profile');
       return;
     }
-
-    final engine = YoloNcnnEngine.getInstance();
-    engine.setTargetSize(resolution);
-    _state = _state.copyWith(activeResolution: resolution);
-    notifyListeners();
+    await switchModel(_state.activeProfile, resolution: resolution);
   }
 
   /// Change active execution backend
   Future<void> setBackend(int backend) async {
-    final engine = YoloNcnnEngine.getInstance();
-    final actual = engine.setBackend(backend: backend);
-    _state = _state.copyWith(activeBackend: actual);
-    notifyListeners();
+    await switchModel(_state.activeProfile, backend: backend);
   }
 
-  /// Extracts assets to temporary cache on demand
-  Future<Map<String, String>> _extractAssets(ModelProfile profile) async {
-    final tempDir = await getTemporaryDirectory();
-    final modelsDir = Directory('${tempDir.path}/models');
-    if (!modelsDir.existsSync()) {
-      modelsDir.createSync(recursive: true);
-    }
-
-    final paramName = profile.paramAsset.split('/').last;
-    final binName = profile.binAsset.split('/').last;
-
-    final paramFile = File('${modelsDir.path}/$paramName');
-    final binFile = File('${modelsDir.path}/$binName');
-
-    final paramData = await rootBundle.load(profile.paramAsset);
-    await paramFile.writeAsBytes(paramData.buffer.asUint8List(), flush: true);
-
-    final binData = await rootBundle.load(profile.binAsset);
-    await binFile.writeAsBytes(binData.buffer.asUint8List(), flush: true);
-
-    return {
-      'param': paramFile.path,
-      'bin': binFile.path,
-    };
-  }
 }

@@ -51,13 +51,14 @@ android {
             abiFilters.clear()
             abiFilters.add("arm64-v8a")
         }
+    }
 
-        externalNativeBuild {
-            cmake {
-                arguments("-DANDROID_STL=c++_shared")
-                abiFilters("arm64-v8a")
-            }
-        }
+    androidResources {
+        noCompress += listOf("bin", "param")
+    }
+
+    aaptOptions {
+        noCompress += listOf("bin", "param")
     }
 
     packaging {
@@ -65,12 +66,6 @@ android {
             excludes += "lib/armeabi-v7a/**"
             excludes += "lib/x86/**"
             excludes += "lib/x86_64/**"
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path = file("../../../native_core/CMakeLists.txt")
         }
     }
 

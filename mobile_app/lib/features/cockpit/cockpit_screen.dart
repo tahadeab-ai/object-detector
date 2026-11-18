@@ -1,581 +1,566 @@
-import 'dart:async';
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import '../../core/ffi/native_structs.dart';
-import '../../core/l10n/coco_labels_repository.dart';
-import '../../core/l10n/multitask_labels_repository.dart';
-import '../../core/models/detection_item.dart';
-import '../../core/models/engine_telemetry.dart';
-import '../../core/models/model_profile.dart';
-import '../../core/models/multitask_results.dart';
+import 'package:flutter/services.dart';
 import '../../core/services/camera_permission_service.dart';
-import '../../core/services/detection_event_bus.dart';
-import '../../core/services/diagnostics_service.dart';
-import '../../core/services/inference_worker.dart';
-import '../../core/services/model_manager.dart';
+import '../../core/services/nihui_native_controller.dart';
 import '../../core/theme/design_tokens.dart';
-import '../diagnostics/diagnostics_screen.dart';
-import '../sample_mode/sample_benchmark_view.dart';
-import '../settings/engine_settings_sheet.dart';
-import 'cockpit_bottom_dock.dart';
-import 'multitask_hud_painter.dart';
-import 'task_selector_strip.dart';
-import 'telemetry_top_bar.dart';
 
 class CockpitScreen extends StatefulWidget {
-  final List<CameraDescription> cameras;
-
-  const CockpitScreen({super.key, required this.cameras});
+  const CockpitScreen({super.key});
 
   @override
   State<CockpitScreen> createState() => _CockpitScreenState();
 }
 
-class _CockpitScreenState extends State<CockpitScreen>
-    with WidgetsBindingObserver {
-  CameraController? _cameraController;
-  List<CameraDescription> _availableCameras = [];
-  bool _isCameraInitialized = false;
-  bool _isCameraPermissionDenied = false;
-  bool _isLoadingCamera = false;
-  bool _isProcessingFrame = false;
+class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserver {
+  bool _hasPermission = false;
+  bool _isCheckingPermission = true;
   bool _isArabic = false;
-  bool _isTorchOn = false;
-  bool _isFrozen = false;
+  bool _isPaused = false;
+  bool _isLoadingModel = false;
 
-  double _confThreshold = 0.25;
-  double _iouThreshold = 0.45;
-  int _activeBackend = 0; // 0=CPU (NEON 4T), 1=Vulkan
-
-  List<DetectionItem> _currentDetections = [];
-  List<SegmentationItem> _currentSegmentations = [];
-  List<PoseItem> _currentPoses = [];
-  List<ClassificationItem> _currentClassifications = [];
-  List<ObbItem> _currentObbs = [];
-
-  EngineTelemetry _currentTelemetry = const EngineTelemetry();
-
-  StreamSubscription<FrameDetectionEvent>? _eventSub;
-  final CocoLabelsRepository _labelsRepo = CocoLabelsRepository();
-  final MultiTaskLabelsRepository _multiTaskRepo = MultiTaskLabelsRepository();
-  final DiagnosticsService _diagService = DiagnosticsService();
-  final InferenceWorker _inferenceWorker = InferenceWorker();
-  final ModelManager _modelManager = ModelManager();
-
-  int _frameCounter = 0;
-  DateTime _lastFpsUpdate = DateTime.now();
-
-  // Watchdog: silent automatic worker recovery
-  Timer? _watchdogTimer;
-  String? _cameraErrorMessage;
-  int _selectedCameraIndex = 0;
+  NihuiTask _selectedTask = NihuiTask.coco;
+  NihuiModel _selectedModel = NihuiModel.n320;
+  NihuiBackend _selectedBackend = NihuiBackend.cpu;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _labelsRepo.load();
-    _multiTaskRepo.load();
-    _modelManager.addListener(_onModelManagerChanged);
-    _availableCameras = List.from(widget.cameras);
-
-    _eventSub = DetectionEventBus().stream.listen((event) {
-      if (!mounted) return;
-      setState(() {
-        _currentDetections = event.detections;
-        _currentTelemetry = event.telemetry;
-      });
-    });
-
-    _inferenceWorker.start().catchError((e) {
-      _diagService.recordError('InferenceWorker start failed: $e');
-    });
-
-    _requestPermissionAndInitCamera();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
-
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused) {
-      _stopWatchdog();
-      _cameraController?.stopImageStream();
-    } else if (state == AppLifecycleState.resumed) {
-      if (!_cameraController!.value.isStreamingImages) {
-        _startCameraStream();
-      }
-    }
-  }
-
-  Future<void> _requestPermissionAndInitCamera() async {
-    setState(() {
-      _isLoadingCamera = true;
-      _cameraErrorMessage = null;
-    });
-
-    final hasPermission = await CameraPermissionService.checkPermission();
-    if (hasPermission) {
-      await _initializeCamera();
-    } else {
-      final granted = await CameraPermissionService.requestPermission();
-      if (granted) {
-        await _initializeCamera();
-      } else {
-        if (!mounted) return;
-        setState(() {
-          _isCameraPermissionDenied = true;
-          _isLoadingCamera = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _initializeCamera() async {
-    try {
-      if (_availableCameras.isEmpty) {
-        _availableCameras = await availableCameras();
-      }
-
-      if (_availableCameras.isEmpty) {
-        if (!mounted) return;
-        setState(() {
-          _isCameraInitialized = false;
-          _isCameraPermissionDenied = false;
-          _isLoadingCamera = false;
-          _cameraErrorMessage = 'No camera hardware found on this device.';
-        });
-        return;
-      }
-
-      int initialIdx = _availableCameras.indexWhere(
-        (c) => c.lensDirection == CameraLensDirection.back,
-      );
-      if (initialIdx < 0) initialIdx = 0;
-      _selectedCameraIndex = initialIdx;
-      final camera = _availableCameras[_selectedCameraIndex];
-
-      final controller = CameraController(
-        camera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-      );
-
-      await controller.initialize();
-      if (!mounted) return;
-
-      _cameraController = controller;
-      await _startCameraStream();
-
-      setState(() {
-        _isCameraInitialized = true;
-        _isCameraPermissionDenied = false;
-        _isLoadingCamera = false;
-        _cameraErrorMessage = null;
-      });
-    } on CameraException catch (e) {
-      _diagService.recordError('CameraException: ${e.code} - ${e.description}');
-      if (e.code == 'CameraAccessDenied' ||
-          e.code == 'CameraAccessDeniedWithoutPrompt') {
-        setState(() {
-          _isCameraPermissionDenied = true;
-          _isLoadingCamera = false;
-        });
-      } else {
-        setState(() {
-          _cameraErrorMessage = 'Camera Error: ${e.description ?? e.code}';
-          _isLoadingCamera = false;
-        });
-      }
-    } catch (e) {
-      _diagService.recordError('Camera init error: $e');
-      setState(() {
-        _cameraErrorMessage = 'Failed to initialize camera: $e';
-        _isLoadingCamera = false;
-      });
-    }
-  }
-
-  Future<void> _startCameraStream() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
-    if (_cameraController!.value.isStreamingImages) return;
-
-    await _cameraController!.startImageStream(_handleCameraFrame);
-    _resetWatchdog();
-  }
-
-  void _resetWatchdog() {
-    _watchdogTimer?.cancel();
-    _watchdogTimer = Timer(const Duration(milliseconds: 1500), () {
-      if (!mounted) return;
-      // Silent automatic worker lock recovery if frame processing ever stalls
-      if (_isProcessingFrame) {
-        _isProcessingFrame = false;
-      }
-    });
-  }
-
-  void _stopWatchdog() {
-    _watchdogTimer?.cancel();
-    _watchdogTimer = null;
-  }
-
-  /// Lock-free single-slot latest-frame gate:
-  /// Never blocks the camera stream, drops frame instantly if isolate is busy or UI is frozen.
-  void _handleCameraFrame(CameraImage image) async {
-    _diagService.recordFrameReceived();
-
-    if (_isProcessingFrame || _inferenceWorker.isBusy || _isFrozen) {
-      _diagService.recordFrameDropped();
-      return;
-    }
-
-    _isProcessingFrame = true;
-    _frameCounter++;
-    final now = DateTime.now();
-    final elapsedMs = now.difference(_lastFpsUpdate).inMilliseconds;
-    if (elapsedMs >= 500) {
-      final currentFps = (_frameCounter * 1000.0) / elapsedMs;
-      _frameCounter = 0;
-      _lastFpsUpdate = now;
-      if (mounted) {
-        setState(() {
-          _currentTelemetry = _currentTelemetry.copyWith(fps: currentFps);
-        });
-      }
-    }
-
-    try {
-      final isNv21 = image.planes.length == 2 ||
-          (image.planes.length > 1 &&
-              (image.planes[1].bytesPerPixel ?? 1) == 2);
-
-      final yPlane = image.planes[0];
-      final uPlane = image.planes.length > 1 ? image.planes[1] : yPlane;
-      final vPlane = image.planes.length > 2 ? image.planes[2] : uPlane;
-
-      final uvPixelStride = isNv21 ? 2 : (uPlane.bytesPerPixel ?? 1);
-      final sensorOrientation =
-          _cameraController?.description.sensorOrientation ?? 90;
-
-      final activeTask = _modelManager.activeTask;
-
-      // Delegate multi-task inference to dedicated background isolate
-      final result = await _inferenceWorker.processMultiTaskFrame(
-        yBytes: yPlane.bytes,
-        uBytes: uPlane.bytes,
-        vBytes: vPlane.bytes,
-        width: image.width,
-        height: image.height,
-        yRowStride: yPlane.bytesPerRow,
-        uvRowStride: uPlane.bytesPerRow,
-        uvPixelStride: uvPixelStride,
-        sensorOrientation: sensorOrientation,
-        backend: _activeBackend,
-        task: activeTask,
-      );
-
-      if (result != null && result.statusCode == 0) {
-        _resetWatchdog();
-        _diagService.recordFrameProcessed();
-
-        final detections = <DetectionItem>[];
-        for (final item in result.detections) {
-          if (item.confidence >= _confThreshold) {
-            detections.add(item);
-          }
-        }
-
-        if (mounted) {
-          setState(() {
-            _currentDetections = detections;
-            _currentSegmentations = result.segmentations;
-            _currentPoses = result.poses;
-            _currentClassifications = result.classifications;
-            _currentObbs = result.obbs;
-          });
-        }
-
-        DetectionEventBus().publish(
-          FrameDetectionEvent(
-            frameId: result.frameId,
-            detections: detections,
-            telemetry: _currentTelemetry.copyWith(
-              inferenceTimeMs: result.inferenceTimeMs,
-              trackerTimeMs: result.postTimeMs,
-              totalLatencyMs:
-                  result.prepTimeMs + result.inferenceTimeMs + result.postTimeMs,
-              activeBackend: result.activeBackend,
-              activeTracks: detections.length,
-              confirmedTracks:
-                  detections.where((d) => d.isConfirmed).length,
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      _diagService.recordError('Frame error: $e');
-    } finally {
-      _isProcessingFrame = false;
-    }
-  }
-
-  void _toggleLanguage() {
-    setState(() => _isArabic = !_isArabic);
-  }
-
-  void _toggleBackend() {
-    final nextBackend = _activeBackend == 1 ? 0 : 1;
-    setState(() {
-      _activeBackend = nextBackend;
-      _currentTelemetry =
-          _currentTelemetry.copyWith(activeBackend: nextBackend);
-    });
-    _diagService.setBackend(nextBackend);
-  }
-
-  Future<void> _toggleTorch() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
-    try {
-      final nextTorch = !_isTorchOn;
-      await _cameraController!.setFlashMode(nextTorch ? FlashMode.torch : FlashMode.off);
-      setState(() => _isTorchOn = nextTorch);
-    } catch (_) {}
-  }
-
-  void _toggleFreeze() {
-    setState(() => _isFrozen = !_isFrozen);
-  }
-
-  Future<void> _switchCamera() async {
-    if (_availableCameras.length < 2) return;
-    try {
-      _selectedCameraIndex =
-          (_selectedCameraIndex + 1) % _availableCameras.length;
-      final newCamera = _availableCameras[_selectedCameraIndex];
-      _stopWatchdog();
-      if (_cameraController?.value.isStreamingImages ?? false) {
-        await _cameraController?.stopImageStream();
-      }
-      await _cameraController?.dispose();
-      final controller = CameraController(
-        newCamera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420,
-      );
-      await controller.initialize();
-      if (!mounted) return;
-      _cameraController = controller;
-      _isTorchOn = false;
-      await _startCameraStream();
-      setState(() {});
-    } catch (e) {
-      debugPrint('Error switching camera: $e');
-    }
-  }
-
-  void _openSettings() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (ctx) => EngineSettingsSheet(
-        initialConfThreshold: _confThreshold,
-        initialIouThreshold: _iouThreshold,
-        isArabic: _isArabic,
-        currentResolution: _modelManager.activeResolution,
-        onResolutionChanged: (res) => _modelManager.setResolution(res),
-        isTorchOn: _isTorchOn,
-        onToggleTorch: _toggleTorch,
-        onOpenDiagnostics: _openDiagnostics,
-        onConfChanged: (val) => setState(() => _confThreshold = val),
-        onIouChanged: (val) => setState(() => _iouThreshold = val),
-      ),
-    );
-  }
-
-  void _openDiagnostics() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => DiagnosticsScreen(isArabic: _isArabic),
-      ),
-    );
-  }
-
-  void _openSampleMode() async {
-    _stopWatchdog();
-    if (_cameraController != null && _cameraController!.value.isStreamingImages) {
-      await _cameraController?.stopImageStream();
-    }
-
-    if (!mounted) return;
-    await Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => SampleBenchmarkView(isArabic: _isArabic),
-      ),
-    );
-
-    // Resume camera stream on return
-    if (_cameraController != null &&
-        _cameraController!.value.isInitialized &&
-        !_cameraController!.value.isStreamingImages) {
-      await _startCameraStream();
-    }
-  }
-
-  Future<void> _onTaskChanged(VisionTask task) async {
-    if (_modelManager.activeTask == task) return;
-
-    final targetProfile = ModelProfile.catalog.firstWhere(
-      (p) => p.task == task,
-      orElse: () => ModelProfile.catalog.first,
-    );
-
-    final success = await _modelManager.switchModel(targetProfile);
-    if (mounted && !success) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: AppTokens.danger,
-          content: Text(
-            _isArabic ? 'فشل تبديل المهمة' : 'Failed to switch task',
-            style: const TextStyle(fontFamily: AppTokens.fontCairo),
-          ),
-        ),
-      );
-    }
-  }
-
-  void _onModelManagerChanged() {
-    if (mounted) setState(() {});
+    _checkAndRequestCameraPermission();
   }
 
   @override
   void dispose() {
-    _stopWatchdog();
     WidgetsBinding.instance.removeObserver(this);
-    _eventSub?.cancel();
-    _modelManager.removeListener(_onModelManagerChanged);
-    _cameraController?.dispose();
-    _inferenceWorker.stop();
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) {
-    final size = MediaQuery.of(context).size;
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!_isPaused && _hasPermission) {
+        NihuiNativeController.setPaused(false);
+      }
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      NihuiNativeController.setPaused(true);
+    }
+  }
 
+  Future<void> _checkAndRequestCameraPermission() async {
+    setState(() => _isCheckingPermission = true);
+    final granted = await CameraPermissionService.checkPermission();
+    if (granted) {
+      setState(() {
+        _hasPermission = true;
+        _isCheckingPermission = false;
+      });
+    } else {
+      final req = await CameraPermissionService.requestPermission();
+      setState(() {
+        _hasPermission = req;
+        _isCheckingPermission = false;
+      });
+    }
+  }
+
+  Future<void> _onTaskChanged(NihuiTask task) async {
+    if (_selectedTask == task || _isLoadingModel) return;
+    setState(() {
+      _selectedTask = task;
+      _isLoadingModel = true;
+    });
+    await NihuiNativeController.reloadModel(
+      taskId: _selectedTask.id,
+      modelId: _selectedModel.id,
+      cpuGpu: _selectedBackend.id,
+    );
+    if (mounted) {
+      setState(() => _isLoadingModel = false);
+    }
+  }
+
+  Future<void> _onModelChanged(NihuiModel model) async {
+    if (_selectedModel == model || _isLoadingModel) return;
+    setState(() {
+      _selectedModel = model;
+      _isLoadingModel = true;
+    });
+    await NihuiNativeController.reloadModel(
+      taskId: _selectedTask.id,
+      modelId: _selectedModel.id,
+      cpuGpu: _selectedBackend.id,
+    );
+    if (mounted) {
+      setState(() => _isLoadingModel = false);
+    }
+  }
+
+  Future<void> _onBackendChanged(NihuiBackend backend) async {
+    if (_selectedBackend == backend || _isLoadingModel) return;
+    setState(() {
+      _selectedBackend = backend;
+      _isLoadingModel = true;
+    });
+    await NihuiNativeController.reloadModel(
+      taskId: _selectedTask.id,
+      modelId: _selectedModel.id,
+      cpuGpu: _selectedBackend.id,
+    );
+    if (mounted) {
+      setState(() => _isLoadingModel = false);
+    }
+  }
+
+  Future<void> _onFlipCamera() async {
+    await NihuiNativeController.switchCamera();
+  }
+
+  Future<void> _onTogglePause() async {
+    final next = !_isPaused;
+    setState(() => _isPaused = next);
+    await NihuiNativeController.setPaused(next);
+  }
+
+  void _onToggleLanguage() {
+    setState(() => _isArabic = !_isArabic);
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppTokens.bg,
+      backgroundColor: Colors.black,
       body: Stack(
-        fit: StackFit.expand,
         children: [
-          // 1. Full-Bleed Camera Preview & 1:1 Co-located HUD CustomPaint (Zero Black Bars)
-          if (_isLoadingCamera)
-            _buildLoadingState()
-          else if (_isCameraInitialized && _cameraController != null)
-            SizedBox.expand(
-              child: FittedBox(
-                fit: BoxFit.cover,
-                child: SizedBox(
-                  // Swap width & height for upright portrait display
-                  width: _cameraController!.value.previewSize?.height ?? size.width,
-                  height: _cameraController!.value.previewSize?.width ?? size.height,
-                  child: Stack(
-                    fit: StackFit.expand,
+          // 1. Native NCNN Camera SurfaceView
+          if (_hasPermission)
+            const SizedBox.expand(
+              child: AndroidView(
+                viewType: 'nihui_camera_surface',
+                creationParamsCodec: StandardMessageCodec(),
+              ),
+            )
+          else if (_isCheckingPermission)
+            _buildLoadingView()
+          else
+            _buildPermissionPromptView(),
+
+          // 2. Glassmorphic Top Controls
+          if (_hasPermission)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 8,
+              left: 12,
+              right: 12,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildTopControlStrip(),
+                  const SizedBox(height: 8),
+                  _buildTaskSelectorStrip(),
+                ],
+              ),
+            ),
+
+          // 3. Floating Bottom Dock
+          if (_hasPermission)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 12,
+              left: 20,
+              right: 20,
+              child: _buildBottomDock(),
+            ),
+
+          // Loading overlay indicator when switching heavy models
+          if (_isLoadingModel)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 120,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black87,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: AppTokens.accent, width: 1.0),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      CameraPreview(_cameraController!),
-                      RepaintBoundary(
-                        child: CustomPaint(
-                          painter: MultiTaskHudPainter(
-                            task: _modelManager.activeTask,
-                            isArabic: _isArabic,
-                            showTrails: true,
-                            detections: _currentDetections,
-                            segmentations: _currentSegmentations,
-                            poses: _currentPoses,
-                            classifications: _currentClassifications,
-                            obbs: _currentObbs,
-                            multiTaskRepo: _multiTaskRepo,
-                            cocoLabelsRepo: _labelsRepo,
-                          ),
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: AppTokens.accent),
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        _isArabic ? 'جاري تحميل النموذج...' : 'Switching Model...',
+                        style: const TextStyle(
+                          fontFamily: AppTokens.fontCairo,
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                     ],
                   ),
                 ),
               ),
-            )
-          else if (_isCameraPermissionDenied)
-            _buildPermissionDeniedState()
-          else if (_cameraErrorMessage != null)
-            _buildErrorState(_cameraErrorMessage!)
-          else
-            _buildFallbackState(),
+            ),
+        ],
+      ),
+    );
+  }
 
-          // 2. Minimal Glassmorphic Top Pill HUD (height <= 48px)
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 8,
-            left: 16,
-            right: 16,
-            child: Center(
-              child: TelemetryTopBar(
-                telemetry: _currentTelemetry,
-                detections: _currentDetections,
-                isArabic: _isArabic,
-                onToggleBackend: _toggleBackend,
+  Widget _buildTopControlStrip() {
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: AppTokens.surfaceGlass,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: AppTokens.hairline, width: 1.0),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black54,
+            blurRadius: 8,
+            offset: Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          // Model Selector Dropdown/Pill
+          PopupMenuButton<NihuiModel>(
+            tooltip: _isArabic ? 'اختيار النموذج' : 'Select Model',
+            color: const Color(0xFF161922),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: const BorderSide(color: AppTokens.hairline),
+            ),
+            initialValue: _selectedModel,
+            onSelected: _onModelChanged,
+            itemBuilder: (context) {
+              return NihuiModel.values.map((model) {
+                final isSelected = model == _selectedModel;
+                return PopupMenuItem<NihuiModel>(
+                  value: model,
+                  child: Row(
+                    children: [
+                      Icon(
+                        isSelected ? Icons.check_circle_rounded : Icons.circle_outlined,
+                        size: 16,
+                        color: isSelected ? AppTokens.accent : AppTokens.muted,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        model.label,
+                        style: TextStyle(
+                          fontFamily: AppTokens.fontMono,
+                          fontSize: 13,
+                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                          color: isSelected ? AppTokens.accent : AppTokens.text,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList();
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: AppTokens.accent.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: AppTokens.accent.withValues(alpha: 0.4)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.memory_rounded, size: 15, color: AppTokens.accent),
+                  const SizedBox(width: 6),
+                  Text(
+                    _selectedModel.label,
+                    style: const TextStyle(
+                      fontFamily: AppTokens.fontMono,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: AppTokens.accent,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  const Icon(Icons.arrow_drop_down, size: 16, color: AppTokens.accent),
+                ],
               ),
             ),
           ),
 
-          // 3. Tactical Task Selector Strip (Detection, Seg, Pose, Cls) - Zero Overlap at top: 64px
-          Positioned(
-            top: MediaQuery.of(context).padding.top + 64,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: TaskSelectorStrip(
-                isArabic: _isArabic,
-                activeTask: _modelManager.activeTask,
-                isLoading: _modelManager.isLoading,
-                onTaskSelected: _onTaskChanged,
-              ),
-            ),
-          ),
-
-          // 4. Clean Tactical 5-Button Floating Bottom Dock
-          Positioned(
-            bottom: MediaQuery.of(context).padding.bottom + 12,
-            left: 16,
-            right: 16,
-            child: Center(
-              child: CockpitBottomDock(
-                isArabic: _isArabic,
-                isFrozen: _isFrozen,
-                onToggleLanguage: _toggleLanguage,
-                onOpenSampleMode: _openSampleMode,
-                onToggleFreeze: _toggleFreeze,
-                onSwitchCamera: _switchCamera,
-                onOpenSettings: _openSettings,
-              ),
-            ),
+          // Backend Switcher Chips (CPU / GPU / Turnip)
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: NihuiBackend.values.map((b) {
+              final isSelected = b == _selectedBackend;
+              return GestureDetector(
+                onTap: () => _onBackendChanged(b),
+                child: Container(
+                  margin: const EdgeInsets.only(left: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: isSelected ? AppTokens.ok.withValues(alpha: 0.25) : Colors.transparent,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: isSelected ? AppTokens.ok : AppTokens.hairline,
+                      width: 1.0,
+                    ),
+                  ),
+                  child: Text(
+                    b.labelEn,
+                    style: TextStyle(
+                      fontFamily: AppTokens.fontMono,
+                      fontSize: 11,
+                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                      color: isSelected ? AppTokens.ok : AppTokens.muted,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildLoadingState() {
+  Widget _buildTaskSelectorStrip() {
     return Container(
-      color: AppTokens.bg,
+      height: 40,
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+      decoration: BoxDecoration(
+        color: AppTokens.surfaceGlass,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: AppTokens.hairline, width: 1.0),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black54,
+            blurRadius: 8,
+            offset: Offset(0, 2),
+          ),
+        ],
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: NihuiTask.values.map((task) {
+            final isSelected = task == _selectedTask;
+            final label = _isArabic ? task.labelAr : task.labelEn;
+
+            IconData icon;
+            switch (task) {
+              case NihuiTask.coco:
+                icon = Icons.crop_free_rounded;
+                break;
+              case NihuiTask.seg:
+                icon = Icons.brush_rounded;
+                break;
+              case NihuiTask.pose:
+                icon = Icons.accessibility_new_rounded;
+                break;
+              case NihuiTask.cls:
+                icon = Icons.category_rounded;
+                break;
+              case NihuiTask.obb:
+                icon = Icons.rotate_90_degrees_ccw_rounded;
+                break;
+            }
+
+            return GestureDetector(
+              onTap: () => _onTaskChanged(task),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                margin: const EdgeInsets.symmetric(horizontal: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: isSelected ? AppTokens.accent.withValues(alpha: 0.25) : Colors.transparent,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: isSelected ? AppTokens.accent : Colors.transparent,
+                    width: 1.0,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      icon,
+                      size: 15,
+                      color: isSelected ? AppTokens.accent : AppTokens.muted,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontFamily: AppTokens.fontCairo,
+                        fontSize: 11,
+                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                        color: isSelected ? AppTokens.accent : AppTokens.text,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomDock() {
+    return Container(
+      height: 52,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: AppTokens.surfaceGlass,
+        borderRadius: BorderRadius.circular(26),
+        border: Border.all(color: AppTokens.hairline, width: 1.0),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black54,
+            blurRadius: 10,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          // Language Toggle
+          IconButton(
+            tooltip: _isArabic ? 'English' : 'عربي',
+            icon: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                border: Border.all(color: AppTokens.hairline),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _isArabic ? 'EN' : 'عربي',
+                style: const TextStyle(
+                  fontFamily: AppTokens.fontCairo,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: AppTokens.accent,
+                ),
+              ),
+            ),
+            onPressed: _onToggleLanguage,
+          ),
+
+          // Flip Camera
+          IconButton(
+            tooltip: _isArabic ? 'تبديل الكاميرا' : 'Flip Camera',
+            icon: const Icon(Icons.flip_camera_ios_outlined, color: AppTokens.text, size: 22),
+            onPressed: _onFlipCamera,
+          ),
+
+          // Pause / Play Stream
+          IconButton(
+            tooltip: _isPaused
+                ? (_isArabic ? 'استئناف' : 'Resume')
+                : (_isArabic ? 'إيقاف مؤقت' : 'Pause'),
+            icon: Icon(
+              _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+              color: _isPaused ? AppTokens.warn : AppTokens.accent,
+              size: 26,
+            ),
+            onPressed: _onTogglePause,
+          ),
+
+          // Info
+          IconButton(
+            tooltip: _isArabic ? 'معلومات المحرك' : 'Engine Info',
+            icon: const Icon(Icons.info_outline_rounded, color: AppTokens.text, size: 22),
+            onPressed: _showInfoDialog,
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showInfoDialog() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF161922),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: AppTokens.hairline),
+          ),
+          title: Text(
+            _isArabic ? 'معلومات محرك YOLO11 NCNN' : 'YOLO11 NCNN Engine Info',
+            style: const TextStyle(
+              fontFamily: AppTokens.fontCairo,
+              color: AppTokens.accent,
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _infoRow(_isArabic ? 'المهمة الحالية:' : 'Active Task:', _selectedTask.labelEn),
+              _infoRow(_isArabic ? 'النموذج النشط:' : 'Active Model:', _selectedModel.label),
+              _infoRow(_isArabic ? 'المعالج:' : 'Backend:', _selectedBackend.labelEn),
+              const Divider(color: AppTokens.hairline, height: 20),
+              Text(
+                _isArabic
+                    ? 'محرك NCNN الأصلي (nihui) متصل مباشرة بـ SurfaceView عبر NdkCamera بدون أي نسخ وسيط.'
+                    : 'Native nihui NCNN engine connected directly to SurfaceView via NdkCamera with zero buffer copy.',
+                style: const TextStyle(
+                  fontFamily: AppTokens.fontCairo,
+                  color: AppTokens.muted,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(
+                _isArabic ? 'إغلاق' : 'Close',
+                style: const TextStyle(
+                  fontFamily: AppTokens.fontCairo,
+                  color: AppTokens.accent,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _infoRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(fontFamily: AppTokens.fontCairo, color: AppTokens.muted, fontSize: 12)),
+          Text(value, style: const TextStyle(fontFamily: AppTokens.fontMono, color: AppTokens.text, fontSize: 12, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLoadingView() {
+    return Container(
+      color: Colors.black,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -583,9 +568,7 @@ class _CockpitScreenState extends State<CockpitScreen>
             const CircularProgressIndicator(color: AppTokens.accent),
             const SizedBox(height: 16),
             Text(
-              _isArabic
-                  ? 'جاري تهيئة الكاميرا ومحرك NCNN...'
-                  : 'Initializing Camera & NCNN Engine...',
+              _isArabic ? 'جاري التحقق من الصلاحيات...' : 'Checking camera permission...',
               style: const TextStyle(
                 fontFamily: AppTokens.fontCairo,
                 color: AppTokens.muted,
@@ -598,189 +581,50 @@ class _CockpitScreenState extends State<CockpitScreen>
     );
   }
 
-  Widget _buildPermissionDeniedState() {
+  Widget _buildPermissionPromptView() {
     return Container(
-      color: AppTokens.surface,
-      padding: const EdgeInsets.all(24),
+      color: Colors.black,
+      padding: const EdgeInsets.all(32),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.videocam_off_outlined,
-                size: 56, color: AppTokens.warn),
+            const Icon(Icons.videocam_off_outlined, size: 64, color: AppTokens.warn),
             const SizedBox(height: 16),
             Text(
-              _isArabic
-                  ? 'إذن استخدام الكاميرا مطلوب'
-                  : 'Camera Permission Required',
+              _isArabic ? 'إذن الكاميرا مطلوب' : 'Camera Permission Required',
               style: const TextStyle(
                 fontFamily: AppTokens.fontCairo,
-                color: AppTokens.text,
-                fontSize: 16,
+                color: Colors.white,
+                fontSize: 18,
                 fontWeight: FontWeight.bold,
               ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _isArabic
-                  ? 'يحتاج التطبيق لإذن الكاميرا لتشغيل الكشف المباشر عن الأهداف.'
-                  : 'Camera access is required for live real-time detection.',
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontFamily: AppTokens.fontCairo,
-                color: AppTokens.muted,
-                fontSize: 12,
-              ),
-            ),
-            const SizedBox(height: 20),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: () async {
-                    final granted =
-                        await CameraPermissionService.requestPermission();
-                    if (granted) {
-                      await _initializeCamera();
-                    } else {
-                      await CameraPermissionService.openAppSettings();
-                    }
-                  },
-                  icon: const Icon(Icons.security_rounded, size: 16),
-                  label: Text(
-                    _isArabic ? 'منح الإذن' : 'Grant Permission',
-                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTokens.accent,
-                    foregroundColor: Colors.black,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                OutlinedButton.icon(
-                  onPressed: _openSampleMode,
-                  icon: const Icon(Icons.photo_library_outlined, size: 16),
-                  label: Text(
-                    _isArabic ? 'وضع الصور' : 'Sample Mode',
-                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
-                  ),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppTokens.accent,
-                    side: const BorderSide(color: AppTokens.accent),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildErrorState(String message) {
-    return Container(
-      color: AppTokens.bg,
-      padding: const EdgeInsets.all(24),
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.error_outline_rounded,
-                size: 56, color: AppTokens.danger),
-            const SizedBox(height: 16),
-            Text(
-              _isArabic ? 'خطأ في تشغيل الكاميرا' : 'Camera Hardware Error',
-              style: const TextStyle(
-                fontFamily: AppTokens.fontCairo,
-                color: AppTokens.text,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontFamily: AppTokens.fontCairo,
-                color: AppTokens.muted,
-                fontSize: 12,
-              ),
-            ),
-            const SizedBox(height: 20),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _requestPermissionAndInitCamera,
-                  icon: const Icon(Icons.refresh_rounded, size: 16),
-                  label: Text(
-                    _isArabic ? 'إعادة المحاولة' : 'Retry',
-                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTokens.accent,
-                    foregroundColor: Colors.black,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                OutlinedButton.icon(
-                  onPressed: _openDiagnostics,
-                  icon: const Icon(Icons.analytics_outlined, size: 16),
-                  label: Text(
-                    _isArabic ? 'التشخيص' : 'Diagnostics',
-                    style: const TextStyle(fontFamily: AppTokens.fontCairo),
-                  ),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppTokens.accent,
-                    side: const BorderSide(color: AppTokens.accent),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildFallbackState() {
-    return Container(
-      color: AppTokens.bg,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.camera_alt_outlined,
-              size: 56,
-              color: AppTokens.muted.withValues(alpha: 0.3),
             ),
             const SizedBox(height: 12),
             Text(
               _isArabic
-                  ? 'بانتظار مستشعر الكاميرا أو وضع الصور المرجعية'
-                  : 'Awaiting Camera Stream or Sample Benchmark',
+                  ? 'يتطلب التطبيق الوصول إلى الكاميرا لتشغيل الكشف الحي والمباشر.'
+                  : 'The app requires camera access for live real-time YOLO detection.',
+              textAlign: TextAlign.center,
               style: const TextStyle(
                 fontFamily: AppTokens.fontCairo,
                 color: AppTokens.muted,
-                fontSize: 12,
+                fontSize: 13,
               ),
             ),
-            const SizedBox(height: 16),
-            OutlinedButton.icon(
-              onPressed: _openSampleMode,
-              icon: const Icon(Icons.photo_library_outlined, size: 16),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              onPressed: _checkAndRequestCameraPermission,
+              icon: const Icon(Icons.check_circle_outline_rounded, size: 18),
               label: Text(
-                _isArabic ? 'فتح وضع الصور المرجعية' : 'Launch Sample Benchmark',
-                style: const TextStyle(
-                  fontFamily: AppTokens.fontCairo,
-                  fontSize: 12,
-                ),
+                _isArabic ? 'منح الإذن' : 'Grant Permission',
+                style: const TextStyle(fontFamily: AppTokens.fontCairo, fontWeight: FontWeight.bold),
               ),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: AppTokens.accent,
-                side: const BorderSide(color: AppTokens.accent),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTokens.accent,
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
               ),
             ),
           ],

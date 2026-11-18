@@ -1,34 +1,19 @@
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
-import 'core/services/diagnostics_service.dart';
 import 'features/cockpit/cockpit_screen.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Initialize native NCNN engine and model assets on startup
-  await DiagnosticsService().initializeEngine();
-
-  List<CameraDescription> cameras = [];
-  try {
-    cameras = await availableCameras();
-  } catch (_) {
-    // Camera may require runtime permission on device
-  }
-
-  runApp(YoloNcnnCockpitApp(cameras: cameras));
+  runApp(const YoloNcnnCockpitApp());
 }
 
 class YoloNcnnCockpitApp extends StatelessWidget {
-  final List<CameraDescription> cameras;
-
-  const YoloNcnnCockpitApp({super.key, required this.cameras});
+  const YoloNcnnCockpitApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'YOLO NCNN Detector',
+      title: 'YOLO NCNN Real-Time Detector',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: Colors.black,
@@ -46,7 +31,7 @@ class YoloNcnnCockpitApp extends StatelessWidget {
         Locale('en', 'US'),
         Locale('ar', 'SA'),
       ],
-      home: CockpitScreen(cameras: cameras),
+      home: const CockpitScreen(),
     );
   }
 }

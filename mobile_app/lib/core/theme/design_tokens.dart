@@ -152,6 +152,7 @@ class AppTokens {
   // Arabic line-height: 1.6
   // ==========================================
   static const String fontCairo = 'Cairo';
+  static const String fontMono = 'monospace';
 
   // Base text styles with Cairo (OFL)
   static const TextStyle type12 = TextStyle(
