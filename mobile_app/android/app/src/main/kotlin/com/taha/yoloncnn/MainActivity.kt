@@ -7,9 +7,12 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.Surface
@@ -19,6 +22,7 @@ import android.view.View
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.tencent.yolo11ncnn.YOLO11Ncnn
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -36,9 +40,15 @@ class MainActivity : FlutterActivity() {
     private val CAMERA_REQ_CODE = 1001
     private val PICK_IMAGE_REQ = 2001
     private val PICK_VIDEO_REQ = 2002
+    private val CAPTURE_IMAGE_REQ = 2003
 
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var pendingMediaPickerResult: MethodChannel.Result? = null
+    private var cameraPhotoFile: File? = null
+
+    // Native synchronizer & Surface readiness
+    val nativeLock = Any()
+    @Volatile var isSurfaceReady = false
 
     // Singleton YOLO11Ncnn instance
     val yolo11ncnn = YOLO11Ncnn()
@@ -121,48 +131,57 @@ class MainActivity : FlutterActivity() {
                     currentModel = modelid
                     currentCpuGpu = cpugpu
 
-                    val ok = yolo11ncnn.loadModel(assets, taskid, modelid, cpugpu)
-                    isModelLoaded = true
-                    Log.i(TAG, "reloadModel(task=$taskid, model=$modelid, cpugpu=$cpugpu) -> $ok")
+                    var ok = false
+                    synchronized(nativeLock) {
+                        ok = yolo11ncnn.loadModel(assets, taskid, modelid, cpugpu)
+                        isModelLoaded = true
+                        Log.i(TAG, "reloadModel(task=$taskid, model=$modelid, cpugpu=$cpugpu) -> $ok")
 
-                    // If in Media Studio with an active photo, re-feed immediately
-                    if (isMediaMode && currentMediaBitmap != null && !isVideoPlaying) {
-                        try {
-                            yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "Re-feed media error: ${t.message}")
+                        // If in Media Studio with an active photo, re-feed immediately
+                        if (isSurfaceReady && isMediaMode && currentMediaBitmap != null && !isVideoPlaying) {
+                            try {
+                                yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "Re-feed media error: ${t.message}")
+                            }
                         }
                     }
                     result.success(ok)
                 }
                 "switchCamera" -> {
-                    stopCameraSafely()
-                    currentFacing = if (currentFacing == 1) 0 else 1
-                    if (!isPaused && !isMediaMode && currentSurface != null) {
-                        startCameraSafely()
+                    synchronized(nativeLock) {
+                        stopCameraSafely()
+                        currentFacing = if (currentFacing == 1) 0 else 1
+                        if (!isPaused && !isMediaMode && isSurfaceReady) {
+                            startCameraSafely()
+                        }
                     }
                     result.success(currentFacing)
                 }
                 "setPaused" -> {
                     val paused = call.argument<Boolean>("paused") ?: false
                     isPaused = paused
-                    if (paused) {
-                        stopCameraSafely()
-                    } else if (!isMediaMode) {
-                        startCameraSafely()
+                    synchronized(nativeLock) {
+                        if (paused) {
+                            stopCameraSafely()
+                        } else if (!isMediaMode && isSurfaceReady) {
+                            startCameraSafely()
+                        }
                     }
                     result.success(true)
                 }
                 "setMediaMode" -> {
                     val enabled = call.argument<Boolean>("enabled") ?: false
                     isMediaMode = enabled
-                    if (enabled) {
-                        stopCameraSafely()
-                    } else {
-                        stopVideoSafely()
-                        currentMediaBitmap = null
-                        if (!isPaused && currentSurface != null) {
-                            startCameraSafely()
+                    synchronized(nativeLock) {
+                        if (enabled) {
+                            stopCameraSafely()
+                        } else {
+                            stopVideoSafely()
+                            currentMediaBitmap = null
+                            if (!isPaused && isSurfaceReady) {
+                                startCameraSafely()
+                            }
                         }
                     }
                     result.success(true)
@@ -171,32 +190,39 @@ class MainActivity : FlutterActivity() {
                     val path = call.argument<String>("path") ?: ""
                     val isAsset = call.argument<Boolean>("isAsset") ?: false
                     Log.i(TAG, "feedPhoto called with path=$path, isAsset=$isAsset")
-                    stopCameraSafely()
-                    stopVideoSafely()
-                    isMediaMode = true
 
-                    val bitmap: Bitmap? = try {
-                        if (isAsset) {
-                            val stream = try {
-                                assets.open("flutter_assets/$path")
-                            } catch (_: Exception) {
-                                assets.open(path)
-                            }
-                            BitmapFactory.decodeStream(stream)
-                        } else {
-                            BitmapFactory.decodeFile(path)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "feedPhoto error: ${e.message}")
-                        null
+                    synchronized(nativeLock) {
+                        stopCameraSafely()
+                        stopVideoSafely()
+                        isMediaMode = true
                     }
 
-                    if (bitmap != null) {
-                        Log.i(TAG, "feedPhoto decoded bitmap: ${bitmap.width}x${bitmap.height}")
-                        val prepared = prepareMediaBitmap(bitmap, 480, 640)
+                    // Decode with 2-pass downsampling and Exif rotation
+                    val decoded = decodeAndOrientImage(path, isAsset)
+                    if (decoded != null) {
+                        val prepared = prepareMediaBitmap(decoded, 480, 640)
+                        if (prepared != decoded) {
+                            decoded.recycle()
+                        }
                         currentMediaBitmap = prepared
-                        val ok = yolo11ncnn.feedBitmap(prepared, 0)
-                        Log.i(TAG, "yolo11ncnn.feedBitmap ok=$ok")
+
+                        // Wait up to 2000ms if surface is not ready yet after intent picker
+                        waitForSurfaceReady(2000L)
+
+                        var ok = false
+                        synchronized(nativeLock) {
+                            if (isSurfaceReady) {
+                                try {
+                                    ok = yolo11ncnn.feedBitmap(prepared, 0)
+                                    Log.i(TAG, "feedBitmap succeeded on ready surface: $ok")
+                                } catch (t: Throwable) {
+                                    Log.e(TAG, "feedBitmap native exception: ${t.message}")
+                                }
+                            } else {
+                                Log.w(TAG, "feedPhoto: surface not ready yet, bitmap cached for surfaceChanged")
+                                ok = true
+                            }
+                        }
                         result.success(ok)
                     } else {
                         Log.e(TAG, "feedPhoto decode failed for $path")
@@ -206,10 +232,16 @@ class MainActivity : FlutterActivity() {
                 "startVideo" -> {
                     val path = call.argument<String>("path") ?: ""
                     val isAsset = call.argument<Boolean>("isAsset") ?: false
-                    stopCameraSafely()
-                    stopVideoSafely()
-                    isMediaMode = true
-                    isVideoPlaying = true
+                    Log.i(TAG, "startVideo called with path=$path, isAsset=$isAsset")
+
+                    synchronized(nativeLock) {
+                        stopCameraSafely()
+                        stopVideoSafely()
+                        isMediaMode = true
+                        isVideoPlaying = true
+                    }
+
+                    waitForSurfaceReady(2000L)
 
                     videoPlaybackThread = Thread {
                         val retriever = MediaMetadataRetriever()
@@ -231,15 +263,22 @@ class MainActivity : FlutterActivity() {
 
                             var currentPositionMs = 0L
                             while (isVideoPlaying) {
-                                if (!isPaused) {
+                                if (!isPaused && isSurfaceReady && isMediaMode) {
                                     val frame = retriever.getFrameAtTime(
                                         currentPositionMs * 1000L,
                                         MediaMetadataRetriever.OPTION_CLOSEST
                                     )
                                     if (frame != null) {
                                         val prepared = prepareMediaBitmap(frame, 480, 640)
+                                        if (prepared != frame) {
+                                            frame.recycle()
+                                        }
                                         currentMediaBitmap = prepared
-                                        yolo11ncnn.feedBitmap(prepared, 0)
+                                        synchronized(nativeLock) {
+                                            if (isSurfaceReady && isMediaMode && isVideoPlaying) {
+                                                yolo11ncnn.feedBitmap(prepared, 0)
+                                            }
+                                        }
                                     }
 
                                     currentPositionMs += frameIntervalMs
@@ -250,7 +289,7 @@ class MainActivity : FlutterActivity() {
                                 Thread.sleep(frameIntervalMs)
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "Video playback thread error: ${e.message}")
+                            Log.e(TAG, "Video playback error: ${e.message}")
                         } finally {
                             try {
                                 retriever.release()
@@ -263,24 +302,65 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "stopVideo" -> {
-                    stopVideoSafely()
+                    synchronized(nativeLock) {
+                        stopVideoSafely()
+                    }
                     result.success(true)
                 }
                 "pickMedia" -> {
                     val type = call.argument<String>("type") ?: "image"
                     pendingMediaPickerResult = result
-                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                        this.type = if (type == "video") "video/*" else "image/*"
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                    }
-                    try {
-                        startActivityForResult(
-                            Intent.createChooser(intent, if (type == "video") "Select Video" else "Select Photo"),
-                            if (type == "video") PICK_VIDEO_REQ else PICK_IMAGE_REQ
-                        )
-                    } catch (e: Exception) {
-                        pendingMediaPickerResult?.error("PICKER_ERROR", e.message, null)
-                        pendingMediaPickerResult = null
+
+                    when (type) {
+                        "camera" -> {
+                            val photoFile = File(cacheDir, "camera_snap_${System.currentTimeMillis()}.jpg")
+                            cameraPhotoFile = photoFile
+                            val photoUri = FileProvider.getUriForFile(
+                                this,
+                                "${packageName}.fileprovider",
+                                photoFile
+                            )
+                            val takePictureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                                putExtra(MediaStore.EXTRA_OUTPUT, photoUri)
+                                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            try {
+                                startActivityForResult(takePictureIntent, CAPTURE_IMAGE_REQ)
+                            } catch (e: Exception) {
+                                pendingMediaPickerResult?.error("CAMERA_ERROR", e.message, null)
+                                pendingMediaPickerResult = null
+                            }
+                        }
+                        "video" -> {
+                            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                                this.type = "video/*"
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                            }
+                            try {
+                                startActivityForResult(
+                                    Intent.createChooser(intent, "Select Video"),
+                                    PICK_VIDEO_REQ
+                                )
+                            } catch (e: Exception) {
+                                pendingMediaPickerResult?.error("PICKER_ERROR", e.message, null)
+                                pendingMediaPickerResult = null
+                            }
+                        }
+                        else -> {
+                            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                                this.type = "image/*"
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                            }
+                            try {
+                                startActivityForResult(
+                                    Intent.createChooser(intent, "Select Photo"),
+                                    PICK_IMAGE_REQ
+                                )
+                            } catch (e: Exception) {
+                                pendingMediaPickerResult?.error("PICKER_ERROR", e.message, null)
+                                pendingMediaPickerResult = null
+                            }
+                        }
                     }
                 }
                 "getState" -> {
@@ -291,12 +371,86 @@ class MainActivity : FlutterActivity() {
                         "facing" to currentFacing,
                         "isCameraOpen" to isCameraOpen,
                         "isPaused" to isPaused,
-                        "isMediaMode" to isMediaMode
+                        "isMediaMode" to isMediaMode,
+                        "isSurfaceReady" to isSurfaceReady
                     )
                     result.success(state)
                 }
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    private fun waitForSurfaceReady(timeoutMs: Long = 2000L): Boolean {
+        val start = System.currentTimeMillis()
+        while (!isSurfaceReady && (System.currentTimeMillis() - start) < timeoutMs) {
+            try {
+                Thread.sleep(30)
+            } catch (_: Exception) {}
+        }
+        return isSurfaceReady
+    }
+
+    private fun decodeAndOrientImage(path: String, isAsset: Boolean): Bitmap? {
+        return try {
+            if (isAsset) {
+                val stream = try {
+                    assets.open("flutter_assets/$path")
+                } catch (_: Exception) {
+                    assets.open(path)
+                }
+                return BitmapFactory.decodeStream(stream)
+            }
+
+            // 1. Check dimensions with inJustDecodeBounds
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            val origW = bounds.outWidth
+            val origH = bounds.outHeight
+            if (origW <= 0 || origH <= 0) {
+                Log.e(TAG, "Invalid image dimensions: ${origW}x${origH}")
+                return null
+            }
+
+            // Target ~960x1280
+            var sampleSize = 1
+            while ((origW / sampleSize) > 1440 || (origH / sampleSize) > 1920) {
+                sampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeFile(path, decodeOptions) ?: return null
+
+            // 2. Read Exif orientation
+            var rotationDegrees = 0
+            try {
+                val exif = ExifInterface(path)
+                rotationDegrees = when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "ExifInterface read error: ${e.message}")
+            }
+
+            if (rotationDegrees != 0) {
+                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                if (rotated != decoded) {
+                    decoded.recycle()
+                }
+                rotated
+            } else {
+                decoded
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "decodeAndOrientImage error: ${e.message}")
+            null
         }
     }
 
@@ -326,31 +480,52 @@ class MainActivity : FlutterActivity() {
     }
 
     fun onSurfaceAvailable(surface: Surface) {
-        currentSurface = surface
-        yolo11ncnn.setOutputWindow(surface)
+        synchronized(nativeLock) {
+            currentSurface = surface
+            try {
+                yolo11ncnn.setOutputWindow(surface)
+                isSurfaceReady = true
+                Log.i(TAG, "onSurfaceAvailable: setOutputWindow ok, isSurfaceReady = true")
+            } catch (t: Throwable) {
+                Log.e(TAG, "setOutputWindow failed: ${t.message}")
+                isSurfaceReady = false
+                return
+            }
 
-        // SAFEGUARD 1: Load default model (0, 0, 0) once during initialization
-        if (!isModelLoaded) {
-            val ok = yolo11ncnn.loadModel(assets, currentTask, currentModel, currentCpuGpu)
-            isModelLoaded = true
-            Log.i(TAG, "Initial loadModel (task=$currentTask, model=$currentModel, cpugpu=$currentCpuGpu) -> $ok")
-        }
+            if (!isModelLoaded) {
+                val ok = yolo11ncnn.loadModel(assets, currentTask, currentModel, currentCpuGpu)
+                isModelLoaded = true
+                Log.i(TAG, "Initial loadModel (task=$currentTask, model=$currentModel, cpugpu=$currentCpuGpu) -> $ok")
+            }
 
-        if (!isPaused && !isMediaMode) {
-            startCameraSafely()
-        } else if (isMediaMode && currentMediaBitmap != null && !isVideoPlaying) {
-            yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
+            if (!isPaused && !isMediaMode) {
+                startCameraSafely()
+            } else if (isMediaMode && currentMediaBitmap != null && !isVideoPlaying) {
+                try {
+                    yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
+                    Log.i(TAG, "onSurfaceAvailable re-fed active media bitmap")
+                } catch (t: Throwable) {
+                    Log.e(TAG, "onSurfaceAvailable re-feed error: ${t.message}")
+                }
+            }
         }
     }
 
     fun onSurfaceDestroyed() {
-        stopCameraSafely()
-        stopVideoSafely()
-        currentSurface = null
-        yolo11ncnn.setOutputWindow(null)
+        synchronized(nativeLock) {
+            isSurfaceReady = false
+            stopCameraSafely()
+            stopVideoSafely()
+            currentSurface = null
+            try {
+                yolo11ncnn.setOutputWindow(null)
+                Log.i(TAG, "onSurfaceDestroyed: setOutputWindow(null) done")
+            } catch (t: Throwable) {
+                Log.e(TAG, "onSurfaceDestroyed setOutputWindow error: ${t.message}")
+            }
+        }
     }
 
-    // SAFEGUARD 2: Prevent double openCamera calls and verify camera permission
     fun startCameraSafely() {
         if (isMediaMode) {
             Log.d(TAG, "startCameraSafely: in media mode, ignoring camera start")
@@ -360,8 +535,8 @@ class MainActivity : FlutterActivity() {
             Log.d(TAG, "startCameraSafely: camera already open")
             return
         }
-        if (currentSurface == null) {
-            Log.d(TAG, "startCameraSafely: surface is null, waiting")
+        if (!isSurfaceReady || currentSurface == null) {
+            Log.d(TAG, "startCameraSafely: surface not ready, waiting")
             return
         }
         val hasPerm = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -386,17 +561,25 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (!isPaused && !isMediaMode && currentSurface != null) {
-            startCameraSafely()
-        } else if (isMediaMode && currentMediaBitmap != null && !isVideoPlaying) {
-            yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
+        synchronized(nativeLock) {
+            if (!isPaused && !isMediaMode && isSurfaceReady) {
+                startCameraSafely()
+            } else if (isMediaMode && isSurfaceReady && currentMediaBitmap != null && !isVideoPlaying) {
+                try {
+                    yolo11ncnn.feedBitmap(currentMediaBitmap, 0)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "onResume feedBitmap error: ${t.message}")
+                }
+            }
         }
     }
 
     override fun onPause() {
         super.onPause()
-        stopVideoSafely()
-        stopCameraSafely()
+        synchronized(nativeLock) {
+            stopVideoSafely()
+            stopCameraSafely()
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -423,6 +606,16 @@ class MainActivity : FlutterActivity() {
                 pendingMediaPickerResult?.success(null)
             }
             pendingMediaPickerResult = null
+        } else if (requestCode == CAPTURE_IMAGE_REQ) {
+            if (resultCode == Activity.RESULT_OK && cameraPhotoFile != null && cameraPhotoFile!!.exists() && cameraPhotoFile!!.length() > 0) {
+                pendingMediaPickerResult?.success(mapOf(
+                    "path" to cameraPhotoFile!!.absolutePath,
+                    "type" to "image"
+                ))
+            } else {
+                pendingMediaPickerResult?.success(null)
+            }
+            pendingMediaPickerResult = null
         }
     }
 
@@ -432,8 +625,10 @@ class MainActivity : FlutterActivity() {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             pendingPermissionResult?.success(granted)
             pendingPermissionResult = null
-            if (granted && !isPaused && currentSurface != null) {
-                startCameraSafely()
+            if (granted && !isPaused && isSurfaceReady) {
+                synchronized(nativeLock) {
+                    startCameraSafely()
+                }
             }
         }
     }

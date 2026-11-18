@@ -792,6 +792,17 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
             mainAxisSize: MainAxisSize.min,
             children: [
               ListTile(
+                leading: const Icon(Icons.camera_alt_rounded, color: AppTokens.accent),
+                title: Text(
+                  _isArabic ? 'التقاط صورة بالكاميرا' : 'Take Camera Snapshot',
+                  style: const TextStyle(fontFamily: AppTokens.fontCairo, color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickGalleryMedia('camera');
+                },
+              ),
+              ListTile(
                 leading: const Icon(Icons.photo_library_rounded, color: AppTokens.accent),
                 title: Text(
                   _isArabic ? 'اختيار صورة من المعرض' : 'Pick Photo from Gallery',

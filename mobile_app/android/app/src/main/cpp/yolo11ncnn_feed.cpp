@@ -7,6 +7,7 @@
 
 #define TAG "YOLO11NcnnFeed"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 typedef void (*on_image_fn)(void* thiz, const unsigned char* nv21, int width, int height);
 
@@ -16,14 +17,14 @@ static on_image_fn s_on_image = nullptr;
 static bool init_symbols() {
     void* handle = dlopen("libyolo11ncnn.so", RTLD_NOW);
     if (!handle) {
-        LOGI("Failed to dlopen libyolo11ncnn.so");
+        LOGE("Failed to dlopen libyolo11ncnn.so: %s", dlerror());
         return false;
     }
 
     if (!s_on_image) {
         s_on_image = (on_image_fn)dlsym(handle, "_ZNK15NdkCameraWindow8on_imageEPKhii");
         if (!s_on_image) {
-            LOGI("Failed to find _ZNK15NdkCameraWindow8on_imageEPKhii");
+            LOGE("Failed to find _ZNK15NdkCameraWindow8on_imageEPKhii");
             return false;
         }
     }
@@ -39,12 +40,21 @@ static bool init_symbols() {
     return false;
 }
 
+static bool is_surface_window_ready() {
+    if (!init_symbols() || !g_camera_ptr || !s_on_image) {
+        return false;
+    }
+    // NdkCameraWindow::win is stored at offset 120 (0x78)
+    void* win = *(void**)((uintptr_t)g_camera_ptr + 120);
+    return win != nullptr;
+}
+
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_tencent_yolo11ncnn_YOLO11Ncnn_feedNv21(JNIEnv* env, jobject thiz, jbyteArray nv21Array, jint width, jint height, jint orientation) {
-    if (!init_symbols() || !g_camera_ptr || !s_on_image) {
-        LOGI("g_camera or s_on_image is null");
+    if (!is_surface_window_ready()) {
+        LOGI("feedNv21: Surface window not ready or ANativeWindow is null");
         return JNI_FALSE;
     }
 
@@ -59,7 +69,11 @@ Java_com_tencent_yolo11ncnn_YOLO11Ncnn_feedNv21(JNIEnv* env, jobject thiz, jbyte
 
     jbyte* bytes = env->GetByteArrayElements(nv21Array, nullptr);
     if (bytes) {
-        s_on_image(g_camera_ptr, (const unsigned char*)bytes, width, height);
+        try {
+            s_on_image(g_camera_ptr, (const unsigned char*)bytes, width, height);
+        } catch (...) {
+            LOGE("feedNv21: Exception inside s_on_image");
+        }
         env->ReleaseByteArrayElements(nv21Array, bytes, JNI_ABORT);
     }
 
@@ -71,20 +85,20 @@ Java_com_tencent_yolo11ncnn_YOLO11Ncnn_feedNv21(JNIEnv* env, jobject thiz, jbyte
 
 JNIEXPORT jboolean JNICALL
 Java_com_tencent_yolo11ncnn_YOLO11Ncnn_feedBitmap(JNIEnv* env, jobject thiz, jobject bitmap, jint orientation) {
-    if (!init_symbols() || !g_camera_ptr || !s_on_image) {
-        LOGI("g_camera or s_on_image is null");
+    if (!is_surface_window_ready()) {
+        LOGI("feedBitmap: Surface window not ready or ANativeWindow is null");
         return JNI_FALSE;
     }
 
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) {
-        LOGI("AndroidBitmap_getInfo failed");
+        LOGE("AndroidBitmap_getInfo failed");
         return JNI_FALSE;
     }
 
     void* pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) {
-        LOGI("AndroidBitmap_lockPixels failed");
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0 || !pixels) {
+        LOGE("AndroidBitmap_lockPixels failed");
         return JNI_FALSE;
     }
 
@@ -131,7 +145,11 @@ Java_com_tencent_yolo11ncnn_YOLO11Ncnn_feedBitmap(JNIEnv* env, jobject thiz, job
     *p_facing = 0;
     *p_orientation = orientation;
 
-    s_on_image(g_camera_ptr, nv21.data(), width, height);
+    try {
+        s_on_image(g_camera_ptr, nv21.data(), width, height);
+    } catch (...) {
+        LOGE("feedBitmap: Exception inside s_on_image");
+    }
 
     *p_facing = old_facing;
     *p_orientation = old_orientation;
