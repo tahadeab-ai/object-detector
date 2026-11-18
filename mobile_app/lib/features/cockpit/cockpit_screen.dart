@@ -18,8 +18,34 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
   bool _isPaused = false;
   bool _isLoadingModel = false;
 
+  // Mode: Live Camera vs Media Studio
+  bool _isMediaStudio = false;
+  int _selectedSampleIndex = 0;
+  String _activeMediaName = 'sample_street.jpg';
+
+  final List<Map<String, String>> _samples = [
+    {
+      'name': 'Street',
+      'nameAr': 'الشارع',
+      'path': 'assets/samples/sample_street.jpg',
+      'type': 'image',
+    },
+    {
+      'name': 'Workspace',
+      'nameAr': 'المكتب',
+      'path': 'assets/samples/sample_workspace.jpg',
+      'type': 'image',
+    },
+    {
+      'name': 'Retail',
+      'nameAr': 'المتجر',
+      'path': 'assets/samples/sample_retail.jpg',
+      'type': 'image',
+    },
+  ];
+
   NihuiTask _selectedTask = NihuiTask.coco;
-  NihuiModel _selectedModel = NihuiModel.n320;
+  NihuiModel _selectedModel = NihuiModel.n320; // Default to n-320
   NihuiBackend _selectedBackend = NihuiBackend.cpu;
 
   @override
@@ -38,7 +64,7 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      if (!_isPaused && _hasPermission) {
+      if (!_isPaused && (_hasPermission || _isMediaStudio)) {
         NihuiNativeController.setPaused(false);
       }
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
@@ -111,8 +137,56 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
     }
   }
 
+  Future<void> _onSwitchMode(bool toMediaStudio) async {
+    if (_isMediaStudio == toMediaStudio) return;
+    setState(() {
+      _isMediaStudio = toMediaStudio;
+    });
+
+    if (toMediaStudio) {
+      await NihuiNativeController.setMediaMode(true);
+      // Automatically load current sample photo into Media Studio
+      await _loadSamplePhoto(_selectedSampleIndex);
+    } else {
+      await NihuiNativeController.setMediaMode(false);
+    }
+  }
+
+  Future<void> _loadSamplePhoto(int index) async {
+    _selectedSampleIndex = index;
+    final sample = _samples[index];
+    setState(() {
+      _activeMediaName = _isArabic ? sample['nameAr']! : sample['name']!;
+    });
+    await NihuiNativeController.feedPhoto(
+      path: sample['path']!,
+      isAsset: true,
+    );
+  }
+
+  Future<void> _pickGalleryMedia(String type) async {
+    final res = await NihuiNativeController.pickMedia(type);
+    if (res != null && res.containsKey('path')) {
+      final path = res['path'] as String;
+      final mediaType = res['type'] as String? ?? type;
+      setState(() {
+        _activeMediaName = path.split('/').last.split('\\').last;
+      });
+
+      if (mediaType == 'video') {
+        await NihuiNativeController.startVideo(path: path, isAsset: false);
+      } else {
+        await NihuiNativeController.feedPhoto(path: path, isAsset: false);
+      }
+    }
+  }
+
   Future<void> _onFlipCamera() async {
-    await NihuiNativeController.switchCamera();
+    if (!_isMediaStudio) {
+      await NihuiNativeController.switchCamera();
+    } else {
+      _showMediaPickerMenu();
+    }
   }
 
   Future<void> _onTogglePause() async {
@@ -129,362 +203,657 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          // 1. Native NCNN Camera SurfaceView
-          if (_hasPermission)
-            const SizedBox.expand(
-              child: AndroidView(
-                viewType: 'nihui_camera_surface',
-                creationParamsCodec: StandardMessageCodec(),
-              ),
-            )
-          else if (_isCheckingPermission)
-            _buildLoadingView()
-          else
-            _buildPermissionPromptView(),
+      body: SafeArea(
+        child: Column(
+          children: [
+            // ==========================================
+            // ZONE 1: TOP CONTROL HEADER (Fixed Height)
+            // ==========================================
+            _buildTopControlHeader(),
 
-          // 2. Glassmorphic Top Controls
-          if (_hasPermission)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 8,
-              left: 12,
-              right: 12,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _buildTopControlStrip(),
-                  const SizedBox(height: 8),
-                  _buildTaskSelectorStrip(),
-                ],
-              ),
-            ),
-
-          // 3. Floating Bottom Dock
-          if (_hasPermission)
-            Positioned(
-              bottom: MediaQuery.of(context).padding.bottom + 12,
-              left: 20,
-              right: 20,
-              child: _buildBottomDock(),
-            ),
-
-          // Loading overlay indicator when switching heavy models
-          if (_isLoadingModel)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 120,
-              left: 0,
-              right: 0,
+            // ==========================================
+            // ZONE 2: CENTER 3:4 VIEWPORT CARD (Expanded)
+            // ==========================================
+            Expanded(
               child: Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.black87,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: AppTokens.accent, width: 1.0),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: AppTokens.accent),
-                      ),
-                      const SizedBox(width: 10),
-                      Text(
-                        _isArabic ? 'جاري تحميل النموذج...' : 'Switching Model...',
-                        style: const TextStyle(
-                          fontFamily: AppTokens.fontCairo,
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  child: AspectRatio(
+                    aspectRatio: 3.0 / 4.0,
+                    child: Container(
+                      clipBehavior: Clip.antiAlias,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0A0C10),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: AppTokens.hairline.withValues(alpha: 0.7),
+                          width: 1.5,
                         ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Colors.black87,
+                            blurRadius: 12,
+                            offset: Offset(0, 4),
+                          ),
+                        ],
                       ),
-                    ],
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          // Native SurfaceView platform view
+                          if (_hasPermission || _isMediaStudio)
+                            const AndroidView(
+                              viewType: 'nihui_camera_surface',
+                              creationParamsCodec: StandardMessageCodec(),
+                            )
+                          else if (_isCheckingPermission)
+                            _buildLoadingView()
+                          else
+                            _buildPermissionPromptView(),
+
+                          // Model Loading Indicator
+                          if (_isLoadingModel)
+                            _buildModelLoadingOverlay(),
+
+                          // Active Media Mode Badge
+                          if (_isMediaStudio)
+                            Positioned(
+                              top: 8,
+                              left: 8,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: Colors.black87.withValues(alpha: 0.8),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: AppTokens.accent.withValues(alpha: 0.6)),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.photo_library_rounded, size: 12, color: AppTokens.accent),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      _activeMediaName,
+                                      style: const TextStyle(
+                                        fontFamily: AppTokens.fontMono,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                        color: AppTokens.accent,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
             ),
-        ],
-      ),
-    );
-  }
 
-  Widget _buildTopControlStrip() {
-    return Container(
-      height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: BoxDecoration(
-        color: AppTokens.surfaceGlass,
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: AppTokens.hairline, width: 1.0),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black54,
-            blurRadius: 8,
-            offset: Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          // Model Selector Dropdown/Pill
-          PopupMenuButton<NihuiModel>(
-            tooltip: _isArabic ? 'اختيار النموذج' : 'Select Model',
-            color: const Color(0xFF161922),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-              side: const BorderSide(color: AppTokens.hairline),
-            ),
-            initialValue: _selectedModel,
-            onSelected: _onModelChanged,
-            itemBuilder: (context) {
-              return NihuiModel.values.map((model) {
-                final isSelected = model == _selectedModel;
-                return PopupMenuItem<NihuiModel>(
-                  value: model,
-                  child: Row(
-                    children: [
-                      Icon(
-                        isSelected ? Icons.check_circle_rounded : Icons.circle_outlined,
-                        size: 16,
-                        color: isSelected ? AppTokens.accent : AppTokens.muted,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        model.label,
-                        style: TextStyle(
-                          fontFamily: AppTokens.fontMono,
-                          fontSize: 13,
-                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                          color: isSelected ? AppTokens.accent : AppTokens.text,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              }).toList();
-            },
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: AppTokens.accent.withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: AppTokens.accent.withValues(alpha: 0.4)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.memory_rounded, size: 15, color: AppTokens.accent),
-                  const SizedBox(width: 6),
-                  Text(
-                    _selectedModel.label,
-                    style: const TextStyle(
-                      fontFamily: AppTokens.fontMono,
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: AppTokens.accent,
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  const Icon(Icons.arrow_drop_down, size: 16, color: AppTokens.accent),
-                ],
-              ),
-            ),
-          ),
-
-          // Backend Switcher Chips (CPU / GPU / Turnip)
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: NihuiBackend.values.map((b) {
-              final isSelected = b == _selectedBackend;
-              return GestureDetector(
-                onTap: () => _onBackendChanged(b),
-                child: Container(
-                  margin: const EdgeInsets.only(left: 4),
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: isSelected ? AppTokens.ok.withValues(alpha: 0.25) : Colors.transparent,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: isSelected ? AppTokens.ok : AppTokens.hairline,
-                      width: 1.0,
-                    ),
-                  ),
-                  child: Text(
-                    b.labelEn,
-                    style: TextStyle(
-                      fontFamily: AppTokens.fontMono,
-                      fontSize: 11,
-                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                      color: isSelected ? AppTokens.ok : AppTokens.muted,
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTaskSelectorStrip() {
-    return Container(
-      height: 40,
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-      decoration: BoxDecoration(
-        color: AppTokens.surfaceGlass,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: AppTokens.hairline, width: 1.0),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black54,
-            blurRadius: 8,
-            offset: Offset(0, 2),
-          ),
-        ],
-      ),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        physics: const BouncingScrollPhysics(),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: NihuiTask.values.map((task) {
-            final isSelected = task == _selectedTask;
-            final label = _isArabic ? task.labelAr : task.labelEn;
-
-            IconData icon;
-            switch (task) {
-              case NihuiTask.coco:
-                icon = Icons.crop_free_rounded;
-                break;
-              case NihuiTask.seg:
-                icon = Icons.brush_rounded;
-                break;
-              case NihuiTask.pose:
-                icon = Icons.accessibility_new_rounded;
-                break;
-              case NihuiTask.cls:
-                icon = Icons.category_rounded;
-                break;
-              case NihuiTask.obb:
-                icon = Icons.rotate_90_degrees_ccw_rounded;
-                break;
-            }
-
-            return GestureDetector(
-              onTap: () => _onTaskChanged(task),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 150),
-                margin: const EdgeInsets.symmetric(horizontal: 2),
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: isSelected ? AppTokens.accent.withValues(alpha: 0.25) : Colors.transparent,
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                    color: isSelected ? AppTokens.accent : Colors.transparent,
-                    width: 1.0,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      icon,
-                      size: 15,
-                      color: isSelected ? AppTokens.accent : AppTokens.muted,
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      label,
-                      style: TextStyle(
-                        fontFamily: AppTokens.fontCairo,
-                        fontSize: 11,
-                        fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                        color: isSelected ? AppTokens.accent : AppTokens.text,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          }).toList(),
+            // ==========================================
+            // ZONE 3: BOTTOM STUDIO BAR (Fixed Height)
+            // ==========================================
+            _buildBottomStudioBar(),
+          ],
         ),
       ),
     );
   }
 
-  Widget _buildBottomDock() {
+  // -------------------------------------------------------------
+  // ZONE 1: TOP CONTROL HEADER
+  // -------------------------------------------------------------
+  Widget _buildTopControlHeader() {
     return Container(
-      height: 52,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        color: AppTokens.surfaceGlass,
-        borderRadius: BorderRadius.circular(26),
-        border: Border.all(color: AppTokens.hairline, width: 1.0),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black54,
-            blurRadius: 10,
-            offset: Offset(0, 3),
+      padding: const EdgeInsets.fromLTRB(10, 4, 10, 4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Row 1: Model Selector (n-320 default) + Backend Selector
+          Row(
+            children: [
+              // Model Selector Dropdown/Pill
+              Expanded(
+                child: Container(
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: AppTokens.surfaceGlass,
+                    borderRadius: BorderRadius.circular(19),
+                    border: Border.all(color: AppTokens.hairline),
+                  ),
+                  child: PopupMenuButton<NihuiModel>(
+                    tooltip: _isArabic ? 'اختيار النموذج' : 'Select Model',
+                    color: const Color(0xFF161922),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: const BorderSide(color: AppTokens.hairline),
+                    ),
+                    initialValue: _selectedModel,
+                    onSelected: _onModelChanged,
+                    itemBuilder: (context) {
+                      return NihuiModel.values.map((model) {
+                        final isSelected = model == _selectedModel;
+                        return PopupMenuItem<NihuiModel>(
+                          value: model,
+                          child: Row(
+                            children: [
+                              Icon(
+                                isSelected ? Icons.check_circle_rounded : Icons.circle_outlined,
+                                size: 16,
+                                color: isSelected ? AppTokens.accent : AppTokens.muted,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                model.label,
+                                style: TextStyle(
+                                  fontFamily: AppTokens.fontMono,
+                                  fontSize: 13,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                                  color: isSelected ? AppTokens.accent : AppTokens.text,
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList();
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.memory_rounded, size: 16, color: AppTokens.accent),
+                          const SizedBox(width: 6),
+                          Text(
+                            _selectedModel.label,
+                            style: const TextStyle(
+                              fontFamily: AppTokens.fontMono,
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: AppTokens.accent,
+                            ),
+                          ),
+                          const Spacer(),
+                          const Icon(Icons.arrow_drop_down_rounded, size: 20, color: AppTokens.muted),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+
+              // Backend Selector Segment
+              Container(
+                height: 38,
+                padding: const EdgeInsets.all(3),
+                decoration: BoxDecoration(
+                  color: AppTokens.surfaceGlass,
+                  borderRadius: BorderRadius.circular(19),
+                  border: Border.all(color: AppTokens.hairline),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: NihuiBackend.values.map((b) {
+                    final isSelected = b == _selectedBackend;
+                    return GestureDetector(
+                      onTap: () => _onBackendChanged(b),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: isSelected ? AppTokens.accent : Colors.transparent,
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                        child: Text(
+                          b.labelEn,
+                          style: TextStyle(
+                            fontFamily: AppTokens.fontMono,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: isSelected ? Colors.black : AppTokens.muted,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+
+          // Row 2: All 5 Task Chips (0: Detection, 1: Segmentation, 2: Pose, 3: Classification, 4: OBB)
+          Container(
+            height: 34,
+            decoration: BoxDecoration(
+              color: AppTokens.surfaceGlass,
+              borderRadius: BorderRadius.circular(17),
+              border: Border.all(color: AppTokens.hairline),
+            ),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: NihuiTask.values.map((task) {
+                  final isSelected = task == _selectedTask;
+                  final label = _isArabic ? task.labelAr : task.labelEn;
+
+                  IconData icon;
+                  switch (task) {
+                    case NihuiTask.coco:
+                      icon = Icons.crop_free_rounded;
+                      break;
+                    case NihuiTask.seg:
+                      icon = Icons.brush_rounded;
+                      break;
+                    case NihuiTask.pose:
+                      icon = Icons.accessibility_new_rounded;
+                      break;
+                    case NihuiTask.cls:
+                      icon = Icons.category_rounded;
+                      break;
+                    case NihuiTask.obb:
+                      icon = Icons.rotate_90_degrees_ccw_rounded;
+                      break;
+                  }
+
+                  return GestureDetector(
+                    onTap: () => _onTaskChanged(task),
+                    child: Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isSelected ? AppTokens.accent.withValues(alpha: 0.25) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: isSelected ? AppTokens.accent : Colors.transparent,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            icon,
+                            size: 13,
+                            color: isSelected ? AppTokens.accent : AppTokens.muted,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            '${task.id}: $label',
+                            style: TextStyle(
+                              fontFamily: AppTokens.fontCairo,
+                              fontSize: 11,
+                              fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                              color: isSelected ? AppTokens.accent : AppTokens.text,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
           ),
         ],
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
+    );
+  }
+
+  // -------------------------------------------------------------
+  // ZONE 3: BOTTOM STUDIO BAR
+  // -------------------------------------------------------------
+  Widget _buildBottomStudioBar() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          // Language Toggle
-          IconButton(
-            tooltip: _isArabic ? 'English' : 'عربي',
-            icon: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                border: Border.all(color: AppTokens.hairline),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                _isArabic ? 'EN' : 'عربي',
-                style: const TextStyle(
-                  fontFamily: AppTokens.fontCairo,
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  color: AppTokens.accent,
+          // Sub-row 1: Mode Switcher Tabs
+          Container(
+            height: 36,
+            padding: const EdgeInsets.all(2),
+            decoration: BoxDecoration(
+              color: AppTokens.surfaceGlass,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: AppTokens.hairline),
+            ),
+            child: Row(
+              children: [
+                // Live Camera Tab
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => _onSwitchMode(false),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: !_isMediaStudio ? AppTokens.accent : Colors.transparent,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      alignment: Alignment.center,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.videocam_rounded,
+                            size: 16,
+                            color: !_isMediaStudio ? Colors.black : AppTokens.muted,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            _isArabic ? 'الكاميرا الحية' : 'Live Camera',
+                            style: TextStyle(
+                              fontFamily: AppTokens.fontCairo,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: !_isMediaStudio ? Colors.black : AppTokens.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                // Media Studio Tab
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => _onSwitchMode(true),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: _isMediaStudio ? AppTokens.accent : Colors.transparent,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      alignment: Alignment.center,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.auto_awesome_motion_rounded,
+                            size: 16,
+                            color: _isMediaStudio ? Colors.black : AppTokens.muted,
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            _isArabic ? 'مختبر الصور والفيديو' : 'Media Studio',
+                            style: TextStyle(
+                              fontFamily: AppTokens.fontCairo,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: _isMediaStudio ? Colors.black : AppTokens.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Sub-row 1b (Media Studio Sample & Source Strip)
+          if (_isMediaStudio) ...[
+            const SizedBox(height: 5),
+            Container(
+              height: 32,
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                child: Row(
+                  children: [
+                    ...List.generate(_samples.length, (i) {
+                      final sample = _samples[i];
+                      final isSel = i == _selectedSampleIndex;
+                      final name = _isArabic ? sample['nameAr']! : sample['name']!;
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => _loadSamplePhoto(i),
+                        child: Container(
+                          margin: const EdgeInsets.only(right: 6),
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: isSel ? AppTokens.accent.withValues(alpha: 0.3) : const Color(0xFF161922),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: isSel ? AppTokens.accent : AppTokens.hairline,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.image_outlined, size: 12, color: isSel ? AppTokens.accent : AppTokens.muted),
+                              const SizedBox(width: 4),
+                              Text(
+                                name,
+                                style: TextStyle(
+                                  fontFamily: AppTokens.fontCairo,
+                                  fontSize: 11,
+                                  fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
+                                  color: isSel ? AppTokens.accent : AppTokens.text,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _pickGalleryMedia('image'),
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161922),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: AppTokens.hairline),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.add_photo_alternate_outlined, size: 12, color: AppTokens.accent),
+                            const SizedBox(width: 4),
+                            Text(
+                              _isArabic ? 'صورة من المعرض' : 'Gallery Photo',
+                              style: const TextStyle(
+                                fontFamily: AppTokens.fontCairo,
+                                fontSize: 11,
+                                color: AppTokens.text,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _pickGalleryMedia('video'),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161922),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: AppTokens.hairline),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.video_library_outlined, size: 12, color: AppTokens.accent),
+                            const SizedBox(width: 4),
+                            Text(
+                              _isArabic ? 'فيديو من المعرض' : 'Gallery Video',
+                              style: const TextStyle(
+                                fontFamily: AppTokens.fontCairo,
+                                fontSize: 11,
+                                color: AppTokens.text,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
-            onPressed: _onToggleLanguage,
-          ),
+          ],
+          const SizedBox(height: 5),
 
-          // Flip Camera
-          IconButton(
-            tooltip: _isArabic ? 'تبديل الكاميرا' : 'Flip Camera',
-            icon: const Icon(Icons.flip_camera_ios_outlined, color: AppTokens.text, size: 22),
-            onPressed: _onFlipCamera,
-          ),
-
-          // Pause / Play Stream
-          IconButton(
-            tooltip: _isPaused
-                ? (_isArabic ? 'استئناف' : 'Resume')
-                : (_isArabic ? 'إيقاف مؤقت' : 'Pause'),
-            icon: Icon(
-              _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-              color: _isPaused ? AppTokens.warn : AppTokens.accent,
-              size: 26,
+          // Sub-row 2: Context Controls (Language, Flip/Pick, Pause/Resume, Info)
+          Container(
+            height: 44,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            decoration: BoxDecoration(
+              color: AppTokens.surfaceGlass,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: AppTokens.hairline),
             ),
-            onPressed: _onTogglePause,
-          ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                // Language Toggle
+                IconButton(
+                  tooltip: _isArabic ? 'English' : 'عربي',
+                  icon: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: AppTokens.hairline),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      _isArabic ? 'EN' : 'عربي',
+                      style: const TextStyle(
+                        fontFamily: AppTokens.fontCairo,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                        color: AppTokens.accent,
+                      ),
+                    ),
+                  ),
+                  onPressed: _onToggleLanguage,
+                ),
 
-          // Info
-          IconButton(
-            tooltip: _isArabic ? 'معلومات المحرك' : 'Engine Info',
-            icon: const Icon(Icons.info_outline_rounded, color: AppTokens.text, size: 22),
-            onPressed: _showInfoDialog,
+                // Flip Camera (Live) OR Pick Media (Studio)
+                IconButton(
+                  tooltip: _isMediaStudio
+                      ? (_isArabic ? 'اختيار وسائط' : 'Pick Media')
+                      : (_isArabic ? 'تبديل الكاميرا' : 'Flip Camera'),
+                  icon: Icon(
+                    _isMediaStudio ? Icons.add_photo_alternate_rounded : Icons.flip_camera_ios_outlined,
+                    color: AppTokens.text,
+                    size: 20,
+                  ),
+                  onPressed: _onFlipCamera,
+                ),
+
+                // Pause / Play Stream
+                IconButton(
+                  tooltip: _isPaused
+                      ? (_isArabic ? 'استئناف' : 'Resume')
+                      : (_isArabic ? 'إيقاف مؤقت' : 'Pause'),
+                  icon: Icon(
+                    _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                    color: _isPaused ? AppTokens.warn : AppTokens.accent,
+                    size: 24,
+                  ),
+                  onPressed: _onTogglePause,
+                ),
+
+                // Info Dialog
+                IconButton(
+                  tooltip: _isArabic ? 'معلومات واختبارات' : 'Info & Benchmarks',
+                  icon: const Icon(Icons.info_outline_rounded, color: AppTokens.text, size: 20),
+                  onPressed: _showInfoDialog,
+                ),
+              ],
+            ),
           ),
         ],
+      ),
+    );
+  }
+
+  void _showMediaPickerMenu() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF161922),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.photo_library_rounded, color: AppTokens.accent),
+                title: Text(
+                  _isArabic ? 'اختيار صورة من المعرض' : 'Pick Photo from Gallery',
+                  style: const TextStyle(fontFamily: AppTokens.fontCairo, color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickGalleryMedia('image');
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.video_library_rounded, color: AppTokens.accent),
+                title: Text(
+                  _isArabic ? 'اختيار فيديو من المعرض' : 'Pick Video from Gallery',
+                  style: const TextStyle(fontFamily: AppTokens.fontCairo, color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _pickGalleryMedia('video');
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildModelLoadingOverlay() {
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black54,
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.black87,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: AppTokens.accent, width: 1.0),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppTokens.accent),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  _isArabic ? 'جاري تحميل النموذج...' : 'Switching Model...',
+                  style: const TextStyle(
+                    fontFamily: AppTokens.fontCairo,
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -512,14 +881,15 @@ class _CockpitScreenState extends State<CockpitScreen> with WidgetsBindingObserv
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _infoRow(_isArabic ? 'المهمة الحالية:' : 'Active Task:', _selectedTask.labelEn),
+              _infoRow(_isArabic ? 'الوضع النشط:' : 'Active Mode:', _isMediaStudio ? 'Media Studio Lab' : 'Live Camera'),
+              _infoRow(_isArabic ? 'المهمة الحالية:' : 'Active Task:', '${_selectedTask.id}: ${_selectedTask.labelEn}'),
               _infoRow(_isArabic ? 'النموذج النشط:' : 'Active Model:', _selectedModel.label),
               _infoRow(_isArabic ? 'المعالج:' : 'Backend:', _selectedBackend.labelEn),
               const Divider(color: AppTokens.hairline, height: 20),
               Text(
                 _isArabic
-                    ? 'محرك NCNN الأصلي (nihui) متصل مباشرة بـ SurfaceView عبر NdkCamera بدون أي نسخ وسيط.'
-                    : 'Native nihui NCNN engine connected directly to SurfaceView via NdkCamera with zero buffer copy.',
+                    ? 'محرك NCNN الأصلي (nihui) متصل مباشرة بـ SurfaceView عبر NdkCamera بنسبة 3:4 مع الحفاظ على الأبعاد الحقيقية بدون أي تشوه أو تقاطع.'
+                    : 'Native nihui NCNN engine connected directly to 3:4 SurfaceView with zero stretch, zero status-bar overlap, and direct photo/video lab.',
                 style: const TextStyle(
                   fontFamily: AppTokens.fontCairo,
                   color: AppTokens.muted,

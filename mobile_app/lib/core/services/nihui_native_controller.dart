@@ -80,6 +80,67 @@ class NihuiNativeController {
     }
   }
 
+  static Future<bool> setMediaMode(bool enabled) async {
+    try {
+      final res = await _channel.invokeMethod<bool>('setMediaMode', {
+        'enabled': enabled,
+      });
+      return res ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> feedPhoto({
+    required String path,
+    required bool isAsset,
+  }) async {
+    try {
+      final res = await _channel.invokeMethod<bool>('feedPhoto', {
+        'path': path,
+        'isAsset': isAsset,
+      });
+      return res ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> startVideo({
+    required String path,
+    required bool isAsset,
+  }) async {
+    try {
+      final res = await _channel.invokeMethod<bool>('startVideo', {
+        'path': path,
+        'isAsset': isAsset,
+      });
+      return res ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> stopVideo() async {
+    try {
+      final res = await _channel.invokeMethod<bool>('stopVideo');
+      return res ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<Map<String, dynamic>?> pickMedia(String type) async {
+    try {
+      final res = await _channel.invokeMapMethod<String, dynamic>('pickMedia', {
+        'type': type,
+      });
+      return res;
+    } catch (e) {
+      return null;
+    }
+  }
+
   static Future<Map<String, dynamic>?> getState() async {
     try {
       final res = await _channel.invokeMapMethod<String, dynamic>('getState');
