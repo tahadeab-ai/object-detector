@@ -73,6 +73,7 @@ native_core/build/
 *.bin
 !mobile_app/android/app/src/main/assets/**
 mobile_app/android/app/src/main/assets/*yolo11m*.bin
+mobile_app/android/app/src/main/assets/*yolo11s*.bin
 !mobile_app/assets/models/model.ncnn.bin
 *.exe
 *.exe~

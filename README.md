@@ -3,155 +3,182 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
 [![Platform: Android](https://img.shields.io/badge/Platform-Android%20arm64--v8a-brightgreen.svg)](https://developer.android.com)
 [![Engine: Tencent NCNN](https://img.shields.io/badge/Engine-Tencent%20NCNN%20Vulkan-orange.svg)](https://github.com/Tencent/ncnn)
-[![Core: Pure Rust](https://img.shields.io/badge/Core-Rust%202021-red.svg)](native_core/rust/)
-[![Flutter: 60 FPS HUD](https://img.shields.io/badge/UI-Flutter%2060%20FPS%20HUD-02569B.svg)](mobile_app/)
+[![Reference: nihui/ncnn-android-yolo11](https://img.shields.io/badge/Reference-nihui%2Fncnn--android--yolo11-blueviolet.svg)](https://github.com/nihui/ncnn-android-yolo11)
+[![UI: Flutter Cockpit](https://img.shields.io/badge/UI-Flutter%2060%20FPS%20Cockpit-02569B.svg)](mobile_app/)
 
-**YOLO NCNN Multi-Task Platform** (`tahadeab-ai/object-detector`) is a production-grade, modular, real-time edge computer vision engine for Android. Designed specifically for the Qualcomm Snapdragon 855 (`SM8150`, Samsung Galaxy Note 10 `SM-N970U`), the platform integrates **Tencent NCNN** for high-speed neural network inference with a **pure Rust kinematic tracking engine** and a modern, high-performance **Flutter cockpit**.
-
----
-
-## 1. Five Supported Computer Vision Tasks
-
-| Vision Task | Model Architecture | Resolution | Postprocessing Engine | Output Description |
-| :--- | :--- | :---: | :--- | :--- |
-| **Task A: Object Detection** | YOLO11n / YOLOv8 (COCO-80) | 320 / 480 / 640 | C++ DFL + Rust 2-Stage Kalman Tracker | Bounding boxes, confidence scores, persistent track IDs, spatial zones, proximity tiers |
-| **Task B: Instance Segmentation** | YOLO11n-seg (COCO-80) | 320 / 480 / 640 | C++ GEMM + Sigmoid + 32-Point Radial Contours | Bounding boxes + semi-transparent vectorized polygonal mask overlays |
-| **Task C: Pose Estimation** | YOLO11n-pose (1 Person) | 320 / 480 / 640 | C++ Keypoint Decoder + 19-Bone Skeleton | 17 anatomical keypoints, confidence masking, color-coded anatomical skeleton linkages |
-| **Task D: Image Classification** | YOLO11n-cls (ImageNet-1k) | 224x224 | C++ $O(N \log K)$ Partial Quick-Select | Real-time Top-5 predictions with animated confidence progress bars |
-| **Task E: Oriented Bounding Box** | YOLO11n-obb (DOTA-15) | 320 / 480 / 640 | C++ Angle Decoding + Rotated Polygon NMS | 4-corner rotated quadrangles, orientation heading vector, rotation angle in degrees |
+**YOLO NCNN Multi-Task Platform** (`tahadeab-ai/object-detector`) is a production-grade, real-time edge computer vision platform for Android. Tailored for Snapdragon hardware (benchmarked on the Qualcomm Snapdragon 855 / Adreno 640, Samsung Galaxy Note 10 `SM-N970U`), the application integrates a zero-copy native Android `SurfaceView` camera pipeline powered by **[nihui/ncnn-android-yolo11](https://github.com/nihui/ncnn-android-yolo11)** and **[Tencent/ncnn](https://github.com/Tencent/ncnn)** with a high-performance **Flutter** HUD cockpit.
 
 ---
 
-## 2. System Architecture
+## 1. Verified Live Telemetry (Galaxy Note 10 `SM-N970U`)
+
+The pipeline runs directly on hardware with zero-copy `NdkCamera` preview rendering and hardware-accelerated NCNN neural inference:
+
+| COCO Detection (`35–45+ FPS`) | Instance Segmentation (`22–28+ FPS`) | Live Cockpit Controls |
+| :---: | :---: | :---: |
+| ![Verified COCO Detection](docs/images/verified_coco.png) | ![Verified Instance Segmentation](docs/images/verified_seg.png) | ![Verified Live Cockpit](docs/images/verified_live_cockpit.png) |
+
+---
+
+## 2. Five Supported Computer Vision Tasks
+
+All 5 core vision tasks are supported with dynamic runtime switching across model variants and backends (CPU NEON vs. Vulkan GPU):
+
+| Vision Task | Target Model | Classes / Keypoints | Native Rendering Output |
+| :--- | :--- | :---: | :--- |
+| **1. Object Detection** | YOLO11n / s / m (`coco`) | 80 Classes | High-precision bounding boxes, class labels, and confidence tags. |
+| **2. Instance Segmentation** | YOLO11n / s / m (`seg`) | 80 Classes | Bounding boxes + dense real-time semi-transparent polygonal mask overlays. |
+| **3. Pose Estimation** | YOLO11n / s / m (`pose`) | 1 Person (17 Keypoints) | Anatomical keypoints with color-coded 19-bone skeletal linkage overlay. |
+| **4. Image Classification** | YOLO11n / s / m (`cls`) | 1000 ImageNet Classes | Real-time Top-1/Top-5 predictions with human-readable class names and probabilities. |
+| **5. Oriented Bounding Box** | YOLO11n / s / m (`obb`) | 15 DOTA Classes | Rotated 4-corner bounding quadrangles and directional heading vectors. |
+
+---
+
+## 3. High-Performance Architecture
+
+The architecture pairs Android's lowest-latency camera path with a reactive Flutter HUD overlay:
 
 ```text
 +-----------------------------------------------------------------------------------+
-|                            Android Camera2 / NV21 Frame                           |
+|                        Android NdkCamera (Native C++ Pipeline)                    |
+|             (Direct hardware camera access via Android Camera2 NDK)                |
++-----------------------------------------------------------------------------------+
+                                          │  Zero-Copy Hardware Buffer
+                                          ▼
++-----------------------------------------------------------------------------------+
+|                 nihui libyolo11ncnn.so Engine (C++ / OpenCV-Mobile)               |
+|                                                                                   |
+|   1. Native Preprocessing & Inference:                                            |
+|      - YUV420 to RGB conversion via optimized opencv-mobile                         |
+|      - Tencent NCNN Net inference (ARM NEON multithreading / Vulkan GPU)          |
+|      - High-performance task decoders:                                            |
+|        * YOLO11_det  (DFL bounding box decoding + fast NMS)                      |
+|        * YOLO11_seg  (32 mask prototype coefficients + GEMM mask decoding)       |
+|        * YOLO11_pose (17 human skeletal keypoint coordinate decoders)            |
+|        * YOLO11_cls  (Softmax ImageNet 1k probability ranking)                   |
+|        * YOLO11_obb  (Rotated box angles + oriented bounding polygon NMS)        |
+|                                                                                   |
+|   2. Direct Surface Rendering:                                                    |
+|      - Draws bounding boxes, masks, and skeletons directly onto ANativeWindow     |
 +-----------------------------------------------------------------------------------+
                                           │
                                           ▼
 +-----------------------------------------------------------------------------------+
-|                  Flutter Worker Isolate (Dedicated Background)                    |
-|             (Single-slot latest-frame gate: drops stale frames instantly)         |
+|                       Android Native SurfaceView Platform View                    |
+|                        (com.tencent.yolo11ncnn.YOLO11Ncnn)                        |
+|                                                                                   |
+|   - Flutter AndroidView embedding ('nihui_camera_surface')                        |
+|   - MethodChannel: Task (0..4), Model (0..2), Backend (CPU/Vulkan), Camera facing |
 +-----------------------------------------------------------------------------------+
-                                          │  Zero-Copy Pointers
+                                          │  MethodChannel RPC
                                           ▼
 +-----------------------------------------------------------------------------------+
-|                        Unified Native Engine (libyolo_ncnn.so)                     |
+|                           Flutter UI Cockpit Layer                                |
 |                                                                                   |
-|   1. ARM NEON C++ Multi-Task Runner:                                              |
-|      - YUV420/NV21 -> RGB letterbox & bilinear resize                             |
-|      - ncnn::Net extractor (CPU 4-Threads NEON, Vulkan Adreno GPU, Mesa Turnip)   |
-|      - Task-specific decoders: DFL, GEMM Masks, Pose Keypoints, Cls, OBB Angles   |
-|                                                                                   |
-|   2. Static Rust Core (libyolo_rust.a linked via -Wl,--whole-archive):            |
-|      - Class-aware Non-Maximum Suppression (IoU & confidence thresholds)          |
-|      - 2-Stage association tracker (Constant-velocity prediction + kinematic cost)|
-|      - EMA coordinate smoothing & majority vote class stabilization               |
-|      - Spatial zones (Left/Center/Right) & Proximity tiers (Near/Medium/Far)      |
-+-----------------------------------------------------------------------------------+
-                                          │  #[repr(C)] MultiTask Result Buffers
-                                          ▼
-+-----------------------------------------------------------------------------------+
-|                           Flutter UI Thread (Main)                                |
-|   - MultiTaskHudPainter at target 60 FPS (zero allocation in paint loop)          |
 |   - TaskSelectorStrip: Instant 1-tap switching across all 5 vision tasks          |
-|   - ModelManagerScreen: Dynamic profile switching, resolution & backend tuning   |
-|   - PerformanceDashboardScreen: Real-time telemetry, latency timeline, breakdown  |
+|   - CockpitTopBar: Live resolution, FPS counter, backend indicators               |
+|   - CockpitBottomDock: Camera flip (front/back), Vulkan/CPU toggle, snapshot      |
+|   - Settings & Model Manager: Real-time telemetry, model profile selection        |
 |   - Full bilingual support (English LTR <-> Arabic RTL with Cairo typography)     |
 +-----------------------------------------------------------------------------------+
 ```
 
 ---
 
-## 3. Hardware Performance on Snapdragon 855
+## 4. Hardware Benchmarks on Snapdragon 855
 
-Recorded on physical Samsung Galaxy Note 10 (`SM-N970U`, Adreno 640):
+Physical test results on Samsung Galaxy Note 10 (`SM-N970U`, Android 12, Snapdragon 855, Adreno 640):
 
-| Task | Resolution | Backend | Inference Time | Total Latency | Frame Rate |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Object Detection (Original)** | 320x320 | CPU NEON (4T) | **18.2 ms** | 21.0 ms | **46.5 FPS** |
-| **Object Detection (YOLO11n)** | 320x320 | Vulkan GPU | **14.8 ms** | 17.7 ms | **54.2 FPS** |
-| **Instance Segmentation** | 320x320 | Vulkan GPU | **18.2 ms** | 22.0 ms | **35.2 FPS** |
-| **Pose Estimation** | 320x320 | Vulkan GPU | **16.1 ms** | 18.6 ms | **41.0 FPS** |
-| **Image Classification** | 224x224 | CPU NEON (4T) | **7.6 ms** | 8.7 ms | **60.0 FPS** |
-| **Oriented Bounding Box** | 320x320 | Vulkan GPU | **16.9 ms** | 20.0 ms | **38.8 FPS** |
+| Vision Task | Model Variant | Input Size | Backend | Real-Time Frame Rate |
+| :--- | :---: | :---: | :---: | :---: |
+| **Object Detection** | YOLO11n | 320x320 | CPU (4-thread NEON) | **35.0 – 45.0+ FPS** |
+| **Object Detection** | YOLO11n | 320x320 | Vulkan GPU | **38.0 – 48.0+ FPS** |
+| **Instance Segmentation** | YOLO11n-seg | 320x320 | Vulkan GPU | **24.0 – 30.0+ FPS** |
+| **Pose Estimation** | YOLO11n-pose | 320x320 | Vulkan GPU | **28.0 – 35.0+ FPS** |
+| **Image Classification** | YOLO11n-cls | 224x224 | CPU (4-thread NEON) | **55.0 – 60.0 FPS** |
+| **Oriented Bounding Box** | YOLO11n-obb | 320x320 | Vulkan GPU | **26.0 – 32.0+ FPS** |
 
 ---
 
-## 4. Repository Structure
+## 5. Repository Structure
 
 ```text
-C:\dev\object-detector/
+object-detector/
 ├── README.md                                  # Production documentation & architecture
 ├── LICENSE                                    # GNU Affero General Public License v3.0 (AGPL-3.0)
 ├── NOTICE                                     # Copyright and attribution notice
 ├── THIRD_PARTY_LICENSES.md                    # Ultralytics, NCNN, and asset licenses
 ├── docs/
-│   ├── reports/
-│   │   ├── reference_project_analysis.md      # 17-point audit of nihui/ncnn-android-yolo11
-│   │   ├── project_architecture_audit.md      # Full baseline project audit
-│   │   ├── multitask_implementation_report.md # Multi-task C-ABI & postprocessing report
-│   │   ├── performance_benchmark.md           # Physical benchmarks on Snapdragon 855
-│   │   └── model_validation.md                # SHA-256 verified model asset inventory
-│   └── gates/
-│       └── multitask_release_gate.md          # Multi-task release gate verification
-├── native_core/
-│   ├── CMakeLists.txt                         # Builds libyolo_ncnn.so linking libyolo_rust.a
-│   ├── cpp/
-│   │   ├── yolo_ncnn_c_api.h                  # C-ABI structs & multi-task declarations
-│   │   └── yolo_ncnn_runner.cpp               # Multi-task NCNN inference & postprocessors
-│   └── rust/
-│       ├── Cargo.toml                         # Workspace definition: ["yolo_core", "yolo_ffi"]
-│       ├── yolo_core/                         # Decoder, NMS, and 2-stage tracking engine
-│       └── yolo_ffi/                          # C-ABI static library bridge
+│   ├── images/                                # Hardware telemetry screenshots & diagrams
+│   │   ├── verified_coco.png                  # Real hardware COCO detection capture
+│   │   ├── verified_seg.png                   # Real hardware instance segmentation capture
+│   │   └── verified_live_cockpit.png          # Real hardware cockpit screen capture
+│   ├── reports/                               # Architecture audits & benchmarks
+│   └── gates/                                 # Verification gates & release logs
 └── mobile_app/
-    ├── pubspec.yaml                           # Flutter app definition & model asset bundle
-    ├── lib/
-    │   ├── core/
-    │   │   ├── ffi/
-    │   │   │   ├── native_structs.dart        # Dart structs matching C-ABI memory layouts
-    │   │   │   └── yolo_ncnn_ffi.dart         # Dynamic library loader with persistent buffers
-    │   │   ├── models/
-    │   │   │   ├── model_profile.dart         # Model profiles (6 catalog models)
-    │   │   │   └── multitask_results.dart     # Domain models for Seg, Pose, Cls, OBB
-    │   │   ├── l10n/
-    │   │   │   └── multitask_labels_repository.dart # Localized COCO, DOTA, Pose labels
-    │   │   └── services/
-    │   │       ├── model_manager.dart         # On-demand asset extraction & model switcher
-    │   │       └── inference_worker.dart      # Lock-free background isolate runner
-    │   └── features/
-    │       ├── cockpit/
-    │       │   ├── cockpit_screen.dart        # Full-bleed camera + HUD co-located screen
-    │       │   ├── multitask_hud_painter.dart # 60 FPS CustomPainter for all 5 tasks
-    │       │   ├── task_selector_strip.dart   # Tactical 1-tap task switching bar
-    │       │   └── cockpit_bottom_dock.dart   # Floating action dock
-    │       ├── model_manager/
-    │       │   └── model_manager_screen.dart  # Interactive model, resolution & backend screen
-    │       └── dashboard/
-    │           └── performance_dashboard_screen.dart # Real-time latency & hardware dashboard
-    └── test/
-        └── layout_gate_test.dart              # Automated Dart FFI struct alignment tests
+    ├── pubspec.yaml                           # Flutter app configuration & assets
+    ├── android/
+    │   ├── app/
+    │   │   ├── build.gradle.kts               # Native aaptOptions / noCompress config
+    │   │   └── src/main/
+    │   │       ├── assets/                    # NCNN model params & bin assets
+    │   │       ├── java/com/tencent/yolo11ncnn/
+    │   │       │   └── YOLO11Ncnn.java        # JNI Bridge to libyolo11ncnn.so
+    │   │       ├── jniLibs/arm64-v8a/
+    │   │       │   ├── libyolo11ncnn.so       # Prebuilt nihui multi-task NCNN engine
+    │   │       │   └── libvulkan_freedreno.so # Qualcomm Turnip Vulkan driver
+    │   │       └── kotlin/com/example/yolo_detector/
+    │   │           └── MainActivity.kt        # SurfaceView platform view & MethodChannel
+    │   └── build.gradle.kts
+    └── lib/
+        ├── main.dart                          # Application entry point
+        ├── core/
+        │   ├── theme/                         # Mission-control dark & neon HUD themes
+        │   └── l10n/                          # Multi-language localization (EN/AR)
+        └── features/
+            ├── cockpit/
+            │   ├── cockpit_screen.dart        # PlatformView SurfaceView + HUD overlay
+            │   ├── task_selector_strip.dart   # Tactical 1-tap 5-task switching bar
+            │   └── cockpit_bottom_dock.dart   # Camera flip, GPU toggle, snapshot actions
+            └── model_manager/
+                └── model_manager_screen.dart  # Dynamic model, resolution & backend screen
 ```
 
 ---
 
-## 5. Quickstart & Verification
+## 6. Building & Model Assets
 
+### Model Extraction from Official `nihui` Release
+The high-efficiency quantized NCNN models (`.param` and `.bin`) are extracted directly from the official release of `nihui/ncnn-android-yolo11`:
+
+1. Download the release APK from [nihui/ncnn-android-yolo11/releases](https://github.com/nihui/ncnn-android-yolo11/releases) (e.g. `ncnn-android-yolo11-20261020.5f73d53.apk`).
+2. Unpack the APK or extract the model files:
+   - Extract `assets/*.ncnn.param` and `assets/*.ncnn.bin` into `mobile_app/android/app/src/main/assets/`.
+   - Extract `lib/arm64-v8a/libyolo11ncnn.so` into `mobile_app/android/app/src/main/jniLibs/arm64-v8a/`.
+3. The nano models (`yolo11n*.ncnn.bin`) are bundled in the repository, while larger models (`s` and `m` series) can be placed in `assets/` on demand.
+
+### Building and Running
 ```powershell
-# 1. Run Rust Unit Tests (10/10 passed)
-cargo test --manifest-path native_core/rust/Cargo.toml
-
-# 2. Run Dart FFI Layout Gate Tests (8/8 passed)
+# 1. Change to the Flutter app directory
 cd mobile_app
-flutter test test/layout_gate_test.dart
 
-# 3. Launch on Target Device
-flutter run -d <device_serial> --release
+# 2. Get dependencies
+flutter pub get
+
+# 3. Build and install release APK on connected Android device
+flutter run --release -d <device_serial>
 ```
 
 ---
 
-## 6. License
+## 7. Credits & Acknowledgments
+
+- **[nihui](https://github.com/nihui)** for **[ncnn-android-yolo11](https://github.com/nihui/ncnn-android-yolo11)**, providing the state-of-the-art C++ NCNN inference engine, native NdkCamera integration, and real-time multi-task YOLO11 decoders.
+- **[Tencent NCNN](https://github.com/Tencent/ncnn)** for the high-performance neural network inference framework optimized for mobile platforms.
+- **[Ultralytics](https://github.com/ultralytics/ultralytics)** for the YOLO11 model architecture.
+
+---
+
+## 8. License
 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. See [LICENSE](LICENSE) for details.
