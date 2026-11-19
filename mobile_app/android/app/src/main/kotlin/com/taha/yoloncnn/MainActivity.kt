@@ -481,6 +481,10 @@ class MainActivity : FlutterActivity() {
 
     fun onSurfaceAvailable(surface: Surface) {
         synchronized(nativeLock) {
+            if (!surface.isValid) {
+                Log.w(TAG, "onSurfaceAvailable: surface is not valid")
+                return
+            }
             currentSurface = surface
             try {
                 yolo11ncnn.setOutputWindow(surface)
@@ -517,12 +521,10 @@ class MainActivity : FlutterActivity() {
             stopCameraSafely()
             stopVideoSafely()
             currentSurface = null
-            try {
-                yolo11ncnn.setOutputWindow(null)
-                Log.i(TAG, "onSurfaceDestroyed: setOutputWindow(null) done")
-            } catch (t: Throwable) {
-                Log.e(TAG, "onSurfaceDestroyed setOutputWindow error: ${t.message}")
-            }
+            // CRITICAL: NEVER pass null to yolo11ncnn.setOutputWindow!
+            // ANativeWindow_fromSurface in libyolo11ncnn.so calls env->GetObjectField on null,
+            // which causes a fatal SIGABRT abort.
+            Log.i(TAG, "onSurfaceDestroyed: cleaned state, surface detached")
         }
     }
 
